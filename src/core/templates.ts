@@ -65,19 +65,33 @@ function arrivalFrame(style: TransitionStyle, scene: string, mood: string): stri
   }
 }
 
-/** Appended to every directive. Models otherwise drift to present tense or second person on a scene change. */
+/** Appended to every arrival directive. Models otherwise drift to present tense or second person on a scene change. */
 export const TENSE_NOTE = 'Keep the existing narrative tense and voice.'
 
-function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string): string {
-  const body = tier === 'arrival'
-    ? arrivalFrame(style, scene, mood)
-    : `${scene} Mood: ${mood} Keep the story inside this scene: let events and the conversation move forward within it, without leaving it or skipping ahead.`
-  return `${body} ${TENSE_NOTE}`
+/**
+ * Standing instructions after scene and mood in every in-stage note. Users can
+ * replace this text (settings.inStageInstructions); the default ends with the
+ * same tense note the arrival frames carry.
+ */
+export const DEFAULT_IN_STAGE_INSTRUCTIONS = `Keep the story inside this scene: let events and the conversation move forward within it, without leaving it or skipping ahead. ${TENSE_NOTE}`
+
+/** Custom instructions, or the default when unset or blank. */
+export function effectiveInstructions(custom: string | null | undefined): string {
+  const t = custom ? clean(custom) : ''
+  return t.length > 0 ? t : DEFAULT_IN_STAGE_INSTRUCTIONS
+}
+
+function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string, instructions: string): string {
+  return tier === 'arrival'
+    ? `${arrivalFrame(style, scene, mood)} ${TENSE_NOTE}`
+    : `${scene} Mood: ${mood} ${instructions}`
 }
 
 export interface RenderOptions {
   transition?: TransitionStyle
   tokenCap?: number
+  /** Replaces DEFAULT_IN_STAGE_INSTRUCTIONS in in-stage notes. Arrival notes ignore it. */
+  instructions?: string | null
 }
 
 export interface RenderedDirective {
@@ -92,7 +106,9 @@ export function renderDirective(tier: Tier, card: StageCard, names: Names, optio
   let scene = clean(substituteNames(card.scene, names))
   let mood = clean(substituteNames(card.mood, names))
 
-  let body = frame(tier, style, scene, mood)
+  const instructions = effectiveInstructions(options.instructions)
+
+  let body = frame(tier, style, scene, mood, instructions)
   let truncated = false
   if (body.length > capChars) {
     // Trim the two card fields, mood first, until the frame fits.
@@ -101,7 +117,7 @@ export function renderDirective(tier: Tier, card: StageCard, names: Names, optio
     if (scene.length + mood.length > budget) mood = truncateToChars(mood, Math.max(24, Math.floor(budget * 0.35)))
     if (scene.length + mood.length > budget) scene = truncateToChars(scene, Math.max(24, budget - mood.length))
     truncated = true
-    body = frame(tier, style, scene, mood)
+    body = frame(tier, style, scene, mood, instructions)
     if (body.length > capChars) body = truncateToChars(body, capChars)
   }
 

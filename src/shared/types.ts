@@ -75,11 +75,17 @@ export interface ConnectionInfo {
 export interface ExtensionSettings {
   /** Connection used for the Distill button. null = user's default. */
   distillConnectionId: string | null
+  /** Standing instructions after scene and mood in every in-stage note. null = the built-in default. */
+  inStageInstructions: string | null
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
   distillConnectionId: null,
+  inStageInstructions: null,
 }
+
+/** Hard cap on custom in-stage instructions; the whole note is capped at DIRECTIVE_TOKEN_CAP anyway. */
+export const INSTRUCTIONS_MAX_CHARS = 400
 
 /** Everything the drawer tab needs to render, for one chat. */
 export interface PanelState {
@@ -95,6 +101,8 @@ export interface PanelState {
   openingHash?: string | null
   /** Why detection did or did not match: 'matched', 'no-match', or the frontend probe reason. */
   openingStatus?: string
+  /** On 'no-match': a short excerpt of what was read as the first message, so the user can see why. */
+  openingSample?: string
   /** Set when the backend could not load the chat/character; shown to the user. */
   error?: string
 }
@@ -102,7 +110,7 @@ export interface PanelState {
 // ---- Frontend → backend messages ---------------------------------------------
 
 export type FrontendMessage =
-  | { type: 'get_state'; chatId: string | null; openingText?: string | null; openingProbe?: string }
+  | { type: 'get_state'; chatId: string | null; openingText?: string | null; openingProbe?: string; openingCandidates?: string[] }
   /** Frontend-observed message count after a deletion; the backend rewinds the pointer if needed. */
   | { type: 'sync_count'; chatId: string; messageCount: number }
   | { type: 'set_enabled'; chatId: string; enabled: boolean; messageCount: number }

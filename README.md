@@ -10,11 +10,14 @@ Stagecoach is an independent, unofficial community extension and is not affiliat
 
 Plenty of cards write their alternate greetings as sequels ("two weeks later…") rather than alternatives. Picking one means a fresh chat with none of the history. Stagecoach lets you play them in any order, in one chat.
 
+![Stagecoach panel: a three-stage route (Slow ranch dusk, Hearthside evening, Fences repaired) with Back/Advance controls and a "Way in" transition style per stage](docs/img/stage-editor.png)
+
 ## Features
  
 - A drawer tab with a per-chat enable toggle.
 - A route builder: pick which greetings count as stages, and in what order.
-- A stage-card editor (label, scene, mood)  with a token count, a live preview of the injected text, and a **Distill** button that drafts the fields with one LLM call (model selectable).
+- A stage-card editor (label, scene, mood) with a token count, a live preview of the injected text, and a **Distill** button that drafts the fields with one LLM call (model selectable).
+- The standing instructions after scene and mood ("Keep the story inside this scene…") are editable from the preview, with a reset to the original wording, so you can tune them for your model.
 - A current-stage selector with **Advance** and **Back**.
 - Two injection modes: appended to the last user message wrapped as `(OOC: …)` (default; steered reliably in testing), or a system message at a chosen depth from the end of history (visible as its own Prompt Breakdown block, but some models ignore it).
 - One note per stage: the first reply after you press Advance gets a scene-change note, and nothing else is injected. Stage 1 never gets a note, since the chat opened with that greeting.
@@ -29,7 +32,7 @@ Plenty of cards write their alternate greetings as sequels ("two weeks later…"
 ## Using it
 
 1. **Enable** the extension for the chat.
-2. **Add greetings to the route** in story order. Cards that write alternate greetings as "later chapters" work well; parallel alternate greetings may have a janky transition if you don't customize the prompt, depending on your model/preset.
+2. **Add greetings to the route** in story order. Cards that write alternate greetings as "later chapters" work well; parallel alternate greetings may have a janky transition without extra prompt customization.
 3. **Edit each stage** and press **Distill** (or fill the fields in by hand), then **Save**. Aim for about 50 tokens per card, hard cap 90. Keep `{{char}}` and `{{user}}` literal; names are substituted at injection time.
 4. For each stage after the first, pick a **Way in** in the route list. It shapes the one note sent when you advance into that stage.
 5. Play. When a scene feels finished, press **Advance**. The next reply opens the new stage the way you chose.

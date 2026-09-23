@@ -26,10 +26,11 @@ import type {
   PanelState,
   StageCard,
 } from './shared/types.ts'
-import { DEFAULT_SETTINGS } from './shared/types.ts'
-import { hashGreeting, isValidHash, normalizeGreeting } from './core/hash.ts'
+import { DEFAULT_SETTINGS, INSTRUCTIONS_MAX_CHARS } from './shared/types.ts'
+import { hashGreeting, isValidHash } from './core/hash.ts'
 import { chooseTier, countHistoryMessages, highestHistoryIndex, reminderDue } from './core/tiers.ts'
-import { breakdownName, renderDirective, estimateTokens, type Names } from './core/templates.ts'
+import { breakdownName, renderDirective, estimateTokens, DEFAULT_IN_STAGE_INSTRUCTIONS, type Names } from './core/templates.ts'
+import { matchGreeting, sample } from './core/opening.ts'
 import { injectDirective } from './core/inject.ts'
 import { applyRoute, depthFor, forkRoute, isTransitionStyle, newRoute, normalizeRoute, reminderEveryFor, rewindTo, setDepth, setReminderEvery, setStage, setTransition, transitionFor } from './core/route.ts'
 
@@ -50,7 +51,7 @@ const fallbackIndexLogged = new Set<string>()
 /** Greeting text with macros resolved for a chat, keyed by `${chatId}:${hash}`. Used to match the chat's opening message. */
 const resolvedGreetingCache = new Map<string, string>()
 /** Last opening-message probe the frontend sent for a chat, reused by state refreshes that do not re-probe. */
-const lastOpening = new Map<string, { text: string | null; probe: string }>()
+const lastOpening = new Map<string, { text: string | null; probe: string; candidates: string[] }>()
 let settingsCache: ExtensionSettings | null = null
 let currentUserId: string | undefined
 
@@ -125,6 +126,12 @@ async function loadSettings(userId?: string): Promise<ExtensionSettings> {
     settingsCache = { ...DEFAULT_SETTINGS }
   }
   return settingsCache
+}
+
+/** Blank or default text stores as null (= use the built-in default); anything else is trimmed and length-capped. */
+function normaliseInstructions(text: string): string | null {
+  const t = text.replace(/\s+/g, ' ').trim().slice(0, INSTRUCTIONS_MAX_CHARS)
+  return t.length === 0 || t === DEFAULT_IN_STAGE_INSTRUCTIONS ? null : t
 }
 
 async function saveSettings(settings: ExtensionSettings, userId?: string): Promise<void> {
@@ -272,7 +279,8 @@ function tryRegisterInterceptor(): void {
       if (!due) return messages
 
       const names = await resolveNames(chatId, context.characterId || route.characterId || null, userId)
-      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash) })
+      const settings = await loadSettings(userId)
+      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash), instructions: settings.inStageInstructions })
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route))
 
       if (result.injectedIndex === null) return { messages: result.messages }
@@ -340,10 +348,6 @@ async function listConnections(userId?: string): Promise<ConnectionInfo[]> {
   }
 }
 
-function comparable(text: string): string {
-  return normalizeGreeting(text).replace(/\s+/g, ' ').toLowerCase()
-}
-
 /** Resolve a greeting's macros the way the host did when it opened the chat, so the stored first message can be matched. */
 async function resolvedGreeting(chatId: string, characterId: string, hash: string, text: string, userId?: string): Promise<string> {
   const key = `${chatId}:${hash}`
@@ -358,48 +362,23 @@ async function resolvedGreeting(chatId: string, characterId: string, hash: strin
   return resolved
 }
 
-/** Letters and digits only, for a tolerant prefix comparison that survives regex/markdown/macro differences. */
-function skeleton(text: string): string {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
-}
-const FUZZY_PREFIX = 160
-const FUZZY_MIN = 40
-
-/** Does `haystack` (the chat's first message, possibly DOM text with name/timestamp) contain the start of `greeting`? */
-function fuzzyContains(greeting: string, haystack: string): boolean {
-  const g = skeleton(greeting)
-  const h = skeleton(haystack)
-  const n = Math.min(g.length, FUZZY_PREFIX)
-  if (n < FUZZY_MIN || h.length < n) return false
-  return h.includes(g.slice(0, n))
-}
-
-async function matchOpening(chatId: string, characterId: string, greetings: GreetingInfo[], openingText: string, userId?: string): Promise<string | null> {
-  const target = comparable(openingText)
-  if (!target) return null
-  for (const g of greetings) {
-    if (g.index < 0) continue
-    if (comparable(g.text) === target) return g.hash
-  }
+/** `readings` are every text the frontend could get for the first message (API content, DOM bubble, first mounted bubble). */
+async function matchOpening(chatId: string, characterId: string, greetings: GreetingInfo[], readings: string[], userId?: string): Promise<string | null> {
+  const candidates: Array<{ key: string; texts: string[] }> = []
   for (const g of greetings) {
     if (g.index < 0) continue
     const resolved = await resolvedGreeting(chatId, characterId, g.hash, g.text, userId)
-    if (comparable(resolved) === target) return g.hash
+    candidates.push({ key: g.hash, texts: resolved === g.text ? [g.text] : [g.text, resolved] })
   }
-  for (const g of greetings) {
-    if (g.index < 0) continue
-    const resolved = resolvedGreetingCache.get(`${chatId}:${g.hash}`) ?? g.text
-    if (fuzzyContains(resolved, openingText) || fuzzyContains(g.text, openingText)) return g.hash
-  }
-  return null
+  return matchGreeting(candidates, readings)
 }
 
-async function buildPanelState(chatId: string | null, userId?: string, openingText?: string | null, openingProbe?: string): Promise<PanelState> {
+async function buildPanelState(chatId: string | null, userId?: string, openingText?: string | null, openingProbe?: string, openingCandidates?: string[]): Promise<PanelState> {
   if (chatId) {
-    if (openingProbe !== undefined) lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe })
+    if (openingProbe !== undefined) lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] })
     else {
       const prev = lastOpening.get(chatId)
-      if (prev) { openingText = prev.text; openingProbe = prev.probe }
+      if (prev) { openingText = prev.text; openingProbe = prev.probe; openingCandidates = prev.candidates }
     }
   }
   const [permissions, settings, connections] = await Promise.all([
@@ -436,10 +415,12 @@ async function buildPanelState(chatId: string | null, userId?: string, openingTe
       greetings.push({ index: g.index, hash, text: g.text, card: await loadCard(hash, userId) })
     }
     state.greetings = greetings
-    if (typeof openingText === 'string' && openingText.trim()) {
-      state.openingHash = await matchOpening(chatId, chat.character_id, greetings, openingText, userId)
+    const readings = [openingText, ...(openingCandidates ?? [])].filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+    if (readings.length > 0) {
+      state.openingHash = await matchOpening(chatId, chat.character_id, greetings, readings, userId)
       state.openingStatus = state.openingHash ? 'matched' : 'no-match'
-      spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (first message ${openingText.length} chars, ${greetings.length} greetings)`)
+      if (!state.openingHash) state.openingSample = sample(readings[0]!)
+      spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (${readings.length} readings, first ${readings[0]!.length} chars starting "${sample(readings[0]!, 60)}", ${greetings.length} greetings)`)
     } else {
       state.openingStatus = openingProbe ?? 'no-text'
     }
@@ -461,9 +442,9 @@ function send(message: BackendMessage, userId?: string): void {
   spindle.sendToFrontend(message, userId)
 }
 
-async function pushStateFor(chatId: string | null, userId?: string, openingText?: string | null, openingProbe?: string): Promise<void> {
+async function pushStateFor(chatId: string | null, userId?: string, openingText?: string | null, openingProbe?: string, openingCandidates?: string[]): Promise<void> {
   try {
-    send({ type: 'state', state: await buildPanelState(chatId, userId, openingText, openingProbe) }, userId)
+    send({ type: 'state', state: await buildPanelState(chatId, userId, openingText, openingProbe, openingCandidates) }, userId)
   } catch (err) {
     send({ type: 'error', message: `Could not load Stagecoach state: ${errMsg(err)}` }, userId)
   }
@@ -589,7 +570,7 @@ spindle.onFrontendMessage(async (payload: unknown, userId: string) => {
   try {
     switch (msg.type) {
       case 'get_state':
-        await pushStateFor(msg.chatId, uid, msg.openingText, msg.openingProbe)
+        await pushStateFor(msg.chatId, uid, msg.openingText, msg.openingProbe, Array.isArray(msg.openingCandidates) ? msg.openingCandidates.filter((t): t is string => typeof t === 'string') : undefined)
         break
 
       case 'set_reminder_every': {
@@ -697,6 +678,9 @@ spindle.onFrontendMessage(async (payload: unknown, userId: string) => {
           distillConnectionId: typeof patch.distillConnectionId === 'string' && patch.distillConnectionId
             ? patch.distillConnectionId
             : patch.distillConnectionId === null ? null : current.distillConnectionId,
+          inStageInstructions: typeof patch.inStageInstructions === 'string'
+            ? normaliseInstructions(patch.inStageInstructions)
+            : patch.inStageInstructions === null ? null : current.inStageInstructions,
         }
         await saveSettings(next, uid)
         await pushStateFor(msg.chatId, uid)

@@ -1,8 +1,10 @@
 // @bun
 // src/shared/types.ts
 var DEFAULT_SETTINGS = {
-  distillConnectionId: null
+  distillConnectionId: null,
+  inStageInstructions: null
 };
+var INSTRUCTIONS_MAX_CHARS = 400;
 var DIRECTIVE_TOKEN_CAP = 120;
 
 // src/core/hash.ts
@@ -100,16 +102,21 @@ function arrivalFrame(style, scene, mood) {
   }
 }
 var TENSE_NOTE = "Keep the existing narrative tense and voice.";
-function frame(tier, style, scene, mood) {
-  const body = tier === "arrival" ? arrivalFrame(style, scene, mood) : `${scene} Mood: ${mood} Keep the story inside this scene: let events and the conversation move forward within it, without leaving it or skipping ahead.`;
-  return `${body} ${TENSE_NOTE}`;
+var DEFAULT_IN_STAGE_INSTRUCTIONS = `Keep the story inside this scene: let events and the conversation move forward within it, without leaving it or skipping ahead. ${TENSE_NOTE}`;
+function effectiveInstructions(custom) {
+  const t = custom ? clean(custom) : "";
+  return t.length > 0 ? t : DEFAULT_IN_STAGE_INSTRUCTIONS;
+}
+function frame(tier, style, scene, mood, instructions) {
+  return tier === "arrival" ? `${arrivalFrame(style, scene, mood)} ${TENSE_NOTE}` : `${scene} Mood: ${mood} ${instructions}`;
 }
 function renderDirective(tier, card, names, options = {}) {
   const style = effectiveTransition(options.transition);
   const capChars = (options.tokenCap ?? DIRECTIVE_TOKEN_CAP) * 4;
   let scene = clean(substituteNames(card.scene, names));
   let mood = clean(substituteNames(card.mood, names));
-  let body = frame(tier, style, scene, mood);
+  const instructions = effectiveInstructions(options.instructions);
+  let body = frame(tier, style, scene, mood, instructions);
   let truncated = false;
   if (body.length > capChars) {
     const frameLen = body.length - scene.length - mood.length;
@@ -119,7 +126,7 @@ function renderDirective(tier, card, names, options = {}) {
     if (scene.length + mood.length > budget)
       scene = truncateToChars(scene, Math.max(24, budget - mood.length));
     truncated = true;
-    body = frame(tier, style, scene, mood);
+    body = frame(tier, style, scene, mood, instructions);
     if (body.length > capChars)
       body = truncateToChars(body, capChars);
   }
@@ -127,6 +134,73 @@ function renderDirective(tier, card, names, options = {}) {
 }
 function breakdownName(stageIndex, stageCount, tier) {
   return `Stagecoach \xB7 stage ${stageIndex + 1}/${stageCount} \xB7 ${tier}`;
+}
+
+// src/core/opening.ts
+function comparable(text) {
+  return normalizeGreeting(text).replace(/\s+/g, " ").toLowerCase();
+}
+function skeleton(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+var CHUNK = 60;
+var FUZZY_MIN = 40;
+var WHOLE_MIN = 12;
+var CHUNKS = 5;
+function chunkStarts(n) {
+  if (n <= CHUNK)
+    return [0];
+  const count = Math.min(CHUNKS, Math.floor(n / CHUNK) + 1);
+  const last = n - CHUNK;
+  const out = [];
+  for (let i = 0;i < count; i++)
+    out.push(Math.round(last * i / (count - 1)));
+  return Array.from(new Set(out));
+}
+var WHOLE = CHUNKS + 1;
+function fuzzyScore(greeting, haystack) {
+  const g = skeleton(greeting);
+  const h = skeleton(haystack);
+  if (g.length < WHOLE_MIN || h.length === 0)
+    return 0;
+  if (h.includes(g))
+    return WHOLE;
+  if (g.length < FUZZY_MIN)
+    return 0;
+  const starts = chunkStarts(g.length);
+  let hits = 0;
+  for (const s of starts)
+    if (h.includes(g.slice(s, s + CHUNK)))
+      hits++;
+  return hits >= Math.max(2, Math.ceil(starts.length / 2)) ? hits : 0;
+}
+function matchGreeting(greetings, readings) {
+  const targets = readings.map(comparable).filter((t) => t.length > 0);
+  if (targets.length === 0)
+    return null;
+  for (const g of greetings) {
+    for (const t of g.texts)
+      if (targets.includes(comparable(t)))
+        return g.key;
+  }
+  let best = null;
+  for (const g of greetings) {
+    let score = 0;
+    for (const t of g.texts)
+      for (const r of readings)
+        score = Math.max(score, fuzzyScore(t, r));
+    if (score === 0)
+      continue;
+    const length = Math.max(...g.texts.map((t) => skeleton(t).length));
+    const better = !best || score > best.score || score === WHOLE && best.score === WHOLE && length > best.length;
+    if (better)
+      best = { key: g.key, score, length };
+  }
+  return best ? best.key : null;
+}
+function sample(text, max = 90) {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t;
 }
 
 // src/core/inject.ts
@@ -414,6 +488,10 @@ async function loadSettings(userId) {
   }
   return settingsCache;
 }
+function normaliseInstructions(text) {
+  const t = text.replace(/\s+/g, " ").trim().slice(0, INSTRUCTIONS_MAX_CHARS);
+  return t.length === 0 || t === DEFAULT_IN_STAGE_INSTRUCTIONS ? null : t;
+}
 async function saveSettings(settings, userId) {
   settingsCache = settings;
   await spindle.userStorage.setJson("settings.json", settings, { indent: 2, userId });
@@ -555,7 +633,8 @@ function tryRegisterInterceptor() {
       if (!due)
         return messages;
       const names = await resolveNames(chatId, context.characterId || route.characterId || null, userId);
-      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash) });
+      const settings = await loadSettings(userId);
+      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash), instructions: settings.inStageInstructions });
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route));
       if (result.injectedIndex === null)
         return { messages: result.messages };
@@ -626,9 +705,6 @@ async function listConnections(userId) {
     return [];
   }
 }
-function comparable(text) {
-  return normalizeGreeting(text).replace(/\s+/g, " ").toLowerCase();
-}
 async function resolvedGreeting(chatId, characterId, hash, text, userId) {
   const key = `${chatId}:${hash}`;
   const cached = resolvedGreetingCache.get(key);
@@ -643,54 +719,26 @@ async function resolvedGreeting(chatId, characterId, hash, text, userId) {
   resolvedGreetingCache.set(key, resolved);
   return resolved;
 }
-function skeleton(text) {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-}
-var FUZZY_PREFIX = 160;
-var FUZZY_MIN = 40;
-function fuzzyContains(greeting, haystack) {
-  const g = skeleton(greeting);
-  const h = skeleton(haystack);
-  const n = Math.min(g.length, FUZZY_PREFIX);
-  if (n < FUZZY_MIN || h.length < n)
-    return false;
-  return h.includes(g.slice(0, n));
-}
-async function matchOpening(chatId, characterId, greetings, openingText, userId) {
-  const target = comparable(openingText);
-  if (!target)
-    return null;
-  for (const g of greetings) {
-    if (g.index < 0)
-      continue;
-    if (comparable(g.text) === target)
-      return g.hash;
-  }
+async function matchOpening(chatId, characterId, greetings, readings, userId) {
+  const candidates = [];
   for (const g of greetings) {
     if (g.index < 0)
       continue;
     const resolved = await resolvedGreeting(chatId, characterId, g.hash, g.text, userId);
-    if (comparable(resolved) === target)
-      return g.hash;
+    candidates.push({ key: g.hash, texts: resolved === g.text ? [g.text] : [g.text, resolved] });
   }
-  for (const g of greetings) {
-    if (g.index < 0)
-      continue;
-    const resolved = resolvedGreetingCache.get(`${chatId}:${g.hash}`) ?? g.text;
-    if (fuzzyContains(resolved, openingText) || fuzzyContains(g.text, openingText))
-      return g.hash;
-  }
-  return null;
+  return matchGreeting(candidates, readings);
 }
-async function buildPanelState(chatId, userId, openingText, openingProbe) {
+async function buildPanelState(chatId, userId, openingText, openingProbe, openingCandidates) {
   if (chatId) {
     if (openingProbe !== undefined)
-      lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe });
+      lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] });
     else {
       const prev = lastOpening.get(chatId);
       if (prev) {
         openingText = prev.text;
         openingProbe = prev.probe;
+        openingCandidates = prev.candidates;
       }
     }
   }
@@ -728,10 +776,13 @@ async function buildPanelState(chatId, userId, openingText, openingProbe) {
       greetings.push({ index: g.index, hash, text: g.text, card: await loadCard(hash, userId) });
     }
     state.greetings = greetings;
-    if (typeof openingText === "string" && openingText.trim()) {
-      state.openingHash = await matchOpening(chatId, chat.character_id, greetings, openingText, userId);
+    const readings = [openingText, ...openingCandidates ?? []].filter((t) => typeof t === "string" && t.trim().length > 0);
+    if (readings.length > 0) {
+      state.openingHash = await matchOpening(chatId, chat.character_id, greetings, readings, userId);
       state.openingStatus = state.openingHash ? "matched" : "no-match";
-      spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (first message ${openingText.length} chars, ${greetings.length} greetings)`);
+      if (!state.openingHash)
+        state.openingSample = sample(readings[0]);
+      spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (${readings.length} readings, first ${readings[0].length} chars starting "${sample(readings[0], 60)}", ${greetings.length} greetings)`);
     } else {
       state.openingStatus = openingProbe ?? "no-text";
     }
@@ -751,9 +802,9 @@ async function buildPanelState(chatId, userId, openingText, openingProbe) {
 function send(message, userId) {
   spindle.sendToFrontend(message, userId);
 }
-async function pushStateFor(chatId, userId, openingText, openingProbe) {
+async function pushStateFor(chatId, userId, openingText, openingProbe, openingCandidates) {
   try {
-    send({ type: "state", state: await buildPanelState(chatId, userId, openingText, openingProbe) }, userId);
+    send({ type: "state", state: await buildPanelState(chatId, userId, openingText, openingProbe, openingCandidates) }, userId);
   } catch (err) {
     send({ type: "error", message: `Could not load Stagecoach state: ${errMsg(err)}` }, userId);
   }
@@ -878,7 +929,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
   try {
     switch (msg.type) {
       case "get_state":
-        await pushStateFor(msg.chatId, uid, msg.openingText, msg.openingProbe);
+        await pushStateFor(msg.chatId, uid, msg.openingText, msg.openingProbe, Array.isArray(msg.openingCandidates) ? msg.openingCandidates.filter((t) => typeof t === "string") : undefined);
         break;
       case "set_reminder_every": {
         const route = await routeForWrite(msg.chatId, uid);
@@ -982,7 +1033,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const patch = msg.settings ?? {};
         const next = {
           ...current,
-          distillConnectionId: typeof patch.distillConnectionId === "string" && patch.distillConnectionId ? patch.distillConnectionId : patch.distillConnectionId === null ? null : current.distillConnectionId
+          distillConnectionId: typeof patch.distillConnectionId === "string" && patch.distillConnectionId ? patch.distillConnectionId : patch.distillConnectionId === null ? null : current.distillConnectionId,
+          inStageInstructions: typeof patch.inStageInstructions === "string" ? normaliseInstructions(patch.inStageInstructions) : patch.inStageInstructions === null ? null : current.inStageInstructions
         };
         await saveSettings(next, uid);
         await pushStateFor(msg.chatId, uid);

@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { hashGreeting, normalizeGreeting, isValidHash } from './hash.ts'
 import { chooseTier, highestHistoryIndex, countHistoryMessages, turnsInStage, reminderDue } from './tiers.ts'
-import { renderDirective, substituteNames, truncateToChars, breakdownName, TENSE_NOTE } from './templates.ts'
+import { renderDirective, substituteNames, truncateToChars, breakdownName, effectiveInstructions, TENSE_NOTE, DEFAULT_IN_STAGE_INSTRUCTIONS } from './templates.ts'
 import { injectDirective, injectSystemAtDepth, appendToLastUser, wrapForAppend, type MessageLike } from './inject.ts'
+import { matchGreeting, fuzzyScore, skeleton } from './opening.ts'
 import { applyRoute, newRoute, normalizeRoute, setStage, depthFor, setDepth, setTransition, transitionFor, rewindTo, forkRoute } from './route.ts'
 import type { StageCard } from '../shared/types.ts'
 
@@ -119,6 +120,25 @@ describe('templates', () => {
     for (const transition of ['cut', 'elapse', 'flow'] as const) {
       expect(renderDirective('arrival', fat, names, { transition }).estimatedTokens).toBeLessThanOrEqual(120)
     }
+  })
+  test('custom in-stage instructions replace the default tail; arrival ignores them', () => {
+    const base = renderDirective('in-stage', card, names).text
+    expect(base.endsWith(DEFAULT_IN_STAGE_INSTRUCTIONS)).toBe(true)
+    const custom = renderDirective('in-stage', card, names, { instructions: 'Stay in the scene.  Short replies. ' }).text
+    expect(custom.endsWith('Stay in the scene. Short replies.')).toBe(true)
+    expect(custom).not.toContain('move forward within it')
+    expect(custom).toContain('ranch house')
+    // Blank or unset falls back to the default wording.
+    expect(renderDirective('in-stage', card, names, { instructions: '   ' }).text).toBe(base)
+    expect(renderDirective('in-stage', card, names, { instructions: null }).text).toBe(base)
+    expect(effectiveInstructions(undefined)).toBe(DEFAULT_IN_STAGE_INSTRUCTIONS)
+    // Arrival wording is untouched by the setting.
+    const arrival = renderDirective('arrival', card, names).text
+    expect(renderDirective('arrival', card, names, { instructions: 'Stay in the scene.' }).text).toBe(arrival)
+    // Long instructions still leave room for the card and stay under the cap.
+    const long = renderDirective('in-stage', card, names, { instructions: 'rule '.repeat(80) })
+    expect(long.estimatedTokens).toBeLessThanOrEqual(120)
+    expect(long.truncated).toBe(true)
   })
   test('token cap is enforced on oversized cards', () => {
     const fat = { ...card, scene: 'word '.repeat(300), mood: 'tone '.repeat(200) }
@@ -261,5 +281,56 @@ describe('route', () => {
     expect(depthFor(setDepth(r, 3))).toBe(3)
     expect(depthFor(setDepth(r, -4))).toBe(0)
     expect(depthFor(setDepth(r, 999))).toBe(20)
+  })
+})
+
+describe('opening greeting match', () => {
+  const intro = 'The ranch house creaks in the wind as evening settles over the valley. Wade sets his hat on the table and looks at you for a long moment before speaking.'
+  const g0 = `${intro} "You came back," he says. "Did not think you would." He pours two cups of coffee and slides one across the table.`
+  const g1 = `${intro} "Barn is on fire," he says flatly, already reaching for the bucket. "Grab the other one and follow me."`
+  const g2 = 'A completely different opening: morning at the county fair, kettle corn and dust, the judge calling the next entry.'
+  const gs = [{ key: 'h0', texts: [g0] }, { key: 'h1', texts: [g1] }, { key: 'h2', texts: [g2] }]
+
+  test('exact and decorated readings match', () => {
+    expect(matchGreeting(gs, [g1])).toBe('h1')
+    expect(matchGreeting(gs, [`Wade\n10:42 PM\n${g1}\n1 / 3`])).toBe('h1')
+    expect(matchGreeting(gs, ['  ' + g2.toUpperCase() + '  '])).toBe('h2')
+  })
+  test('shared intro paragraph does not pick the wrong alternate', () => {
+    expect(matchGreeting(gs, [g0])).toBe('h0')
+    expect(matchGreeting(gs, [g1])).toBe('h1')
+    expect(fuzzyScore(g0, g1)).toBeLessThan(fuzzyScore(g1, g1))
+  })
+  test('a rewritten opening (image, html or macro at the top) still matches on the rest', () => {
+    // First sentence lost to an image or html block at the top of the bubble.
+    const firstSentence = intro.indexOf('. ') + 2
+    expect(matchGreeting(gs, [g0.slice(firstSentence)])).toBe('h0')
+    // Most of the greeting missing is not enough evidence.
+    expect(matchGreeting(gs, [g0.slice(intro.length)])).toBeNull()
+    const resolved = g1.replace('you', 'Cherlene')
+    expect(matchGreeting([{ key: 'h1', texts: [g1, resolved] }], [`<img> ${resolved}`])).toBe('h1')
+  })
+  test('short greetings match when the whole text sits inside a decorated bubble', () => {
+    const short = 'Evening comes down slow over the ranch.'
+    const longer = 'Evening comes down slow over the ranch. Wade is already on the porch.'
+    const card = [{ key: 'short', texts: [short] }, { key: 'longer', texts: [longer] }, { key: 'h2', texts: [g2] }]
+    expect(matchGreeting(card, [`TThe Ranch Demo Card#0·Sep 23, 12:26 PM${short} Greetings3`])).toBe('short')
+    // One greeting being a prefix of another: the reading decides, longer wins when both fit.
+    expect(matchGreeting(card, [`Wade
+${longer}
+2 / 3`])).toBe('longer')
+    // Too short to trust loosely: only an exact reading matches.
+    const tiny = [{ key: 'tiny', texts: ['Hello.'] }]
+    expect(matchGreeting(tiny, ['Wade 12:26 PM Hello. 1 / 3'])).toBeNull()
+    expect(matchGreeting(tiny, ['Hello.'])).toBe('tiny')
+  })
+  test('several readings are all tried', () => {
+    expect(matchGreeting(gs, ['Hi there, my first user turn.', g2])).toBe('h2')
+  })
+  test('unrelated or empty text does not match', () => {
+    expect(matchGreeting(gs, ['A user message that is long enough to have chunks of its own but shares nothing with the greetings at all, really nothing.'])).toBeNull()
+    expect(matchGreeting(gs, ['', '   '])).toBeNull()
+    expect(fuzzyScore('short', 'short')).toBe(0) // below WHOLE_MIN
+    expect(skeleton('Hé, "you"—there! 42')).toBe('héyouthere42')
   })
 })

@@ -12,9 +12,9 @@ import type {
   PanelState,
   StageCard,
 } from './shared/types.ts'
-import { CARD_TOKEN_CAP, CARD_TOKEN_TARGET, DIRECTIVE_TOKEN_CAP } from './shared/types.ts'
+import { CARD_TOKEN_CAP, CARD_TOKEN_TARGET, DIRECTIVE_TOKEN_CAP, INSTRUCTIONS_MAX_CHARS } from './shared/types.ts'
 import { chooseTier, turnsInStage, reminderDue } from './core/tiers.ts'
-import { renderDirective, estimateTokens, TRANSITION_STYLES } from './core/templates.ts'
+import { renderDirective, estimateTokens, effectiveInstructions, DEFAULT_IN_STAGE_INSTRUCTIONS, TRANSITION_STYLES } from './core/templates.ts'
 import { depthFor, MAX_DEPTH, transitionFor, reminderEveryFor } from './core/route.ts'
 import { wrapForAppend } from './core/inject.ts'
 import type { TransitionStyle } from './shared/types.ts'
@@ -59,6 +59,8 @@ const CSS = /* css */ `
   .sc-toggle { display: inline-flex; align-items: center; gap: 6px; }
   .sc-transition { margin-top: 5px; }
   .sc-transition select { font-size: 11px; padding: 2px 4px; }
+  .sc-instructions { margin-top: 4px; }
+  .sc-instructions .sc-field { margin-top: 4px; }
 `
 
 const ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="20" height="20"><path d="M2 5h3l1-2h8l1 2h3v2h-1l-1 8h-2a2 2 0 1 1-4 0H9a2 2 0 1 1-4 0H4L3 7H2V5zm5 1h6l-.5-1h-5L7 6z"/></svg>`
@@ -95,6 +97,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let tokenRequestId = 0
   let tokenLabel: HTMLElement | null = null
   let tokenTimer: ReturnType<typeof setTimeout> | null = null
+  /** The in-stage instructions editor under the preview: open state and unsaved text (null = show the saved value). */
+  let instructionsOpen = false
+  let instructionsDraft: string | null = null
 
   const tab = ctx.ui.registerDrawerTab({
     id: 'stagecoach',
@@ -127,26 +132,41 @@ export function setup(ctx: SpindleFrontendContext) {
    * Tries the host's optional messages API, then the mounted message bubble in
    * the DOM (present on a fresh chat, which is when detection matters most).
    */
-  async function openingText(): Promise<{ text: string | null; probe: string }> {
+  async function openingText(): Promise<{ text: string | null; probe: string; candidates: string[] }> {
+    // Every reading of the first message is sent and the backend tries them all: the default
+    // greeting can be a synthetic row that the message list and the mounted bubbles disagree on.
+    const candidates: string[] = []
     try {
       const id = ctx.messages.getMessageIdAtIndex(0)
-      if (!id) return { text: null, probe: 'no-first-message' }
-      if (ctx.messages.get) {
-        const m = await ctx.messages.get(id).catch(() => null)
-        if (m) {
-          if (m.is_user) return { text: null, probe: 'first-message-is-yours' }
-          const active = typeof m.content === 'string' && m.content
-            ? m.content
-            : Array.isArray(m.swipes) ? m.swipes[m.swipe_id ?? 0] ?? null : null
-          if (active) return { text: active, probe: 'ok' }
+      let probe = 'no-first-message'
+      if (id) {
+        if (ctx.messages.get) {
+          const m = await ctx.messages.get(id).catch(() => null)
+          if (m) {
+            // A user turn at index 0 means the greeting was not in the list; the topmost bubble is still checked below.
+            if (m.is_user) probe = 'first-message-is-yours'
+            const active = m.is_user ? null : typeof m.content === 'string' && m.content
+              ? m.content
+              : Array.isArray(m.swipes) ? m.swipes[m.swipe_id ?? 0] ?? null : null
+            if (active) { candidates.push(active); probe = 'ok' }
+          }
         }
+        const bubble = probe === 'first-message-is-yours' ? null : ctx.dom.findMessageElement(id)
+        const text = bubble?.textContent?.trim() ?? ''
+        if (text.length > 0) { candidates.push(text); if (probe === 'no-first-message') probe = 'ok-dom' }
+        else if (probe === 'no-first-message') probe = 'first-message-not-on-screen'
       }
-      const bubble = ctx.dom.findMessageElement(id)
-      const text = bubble?.textContent?.trim() ?? ''
-      if (text.length > 0) return { text, probe: 'ok-dom' }
-      return { text: null, probe: 'first-message-not-on-screen' }
+      // The topmost mounted bubble, when it is not the one the message list calls index 0.
+      try {
+        const top = ctx.dom.listMessageElements()[0]
+        if (top && top.messageId !== id) {
+          const text = top.element.textContent?.trim() ?? ''
+          if (text.length > 0) { candidates.push(text); if (candidates.length === 1) probe = 'ok-dom-top' }
+        }
+      } catch { /* optional host API */ }
+      return { text: candidates[0] ?? null, probe, candidates: candidates.slice(1) }
     } catch (err) {
-      return { text: null, probe: `error: ${err instanceof Error ? err.message : String(err)}` }
+      return { text: candidates[0] ?? null, probe: `error: ${err instanceof Error ? err.message : String(err)}`, candidates: candidates.slice(1) }
     }
   }
 
@@ -155,9 +175,9 @@ export function setup(ctx: SpindleFrontendContext) {
     chatId = activeChatId()
     const forChat = chatId
     const run = ++probeRun
-    void openingText().then(({ text, probe }) => {
+    void openingText().then(({ text, probe, candidates }) => {
       if (chatId !== forChat || run !== probeRun) return
-      send({ type: 'get_state', chatId: forChat, openingText: text, openingProbe: probe })
+      send({ type: 'get_state', chatId: forChat, openingText: text, openingProbe: probe, openingCandidates: candidates })
       if (text || !forChat) return
       // On a fresh chat the first bubble is not mounted yet when CHAT_SWITCHED fires. Try again a few times.
       for (const delay of [600, 1500, 3500]) {
@@ -166,7 +186,7 @@ export function setup(ctx: SpindleFrontendContext) {
           void openingText().then((again) => {
             if (!again.text || chatId !== forChat || run !== probeRun) return
             probeRun++
-            send({ type: 'get_state', chatId: forChat, openingText: again.text, openingProbe: again.probe })
+            send({ type: 'get_state', chatId: forChat, openingText: again.text, openingProbe: again.probe, openingCandidates: again.candidates })
           })
         }, delay)
       }
@@ -415,7 +435,9 @@ export function setup(ctx: SpindleFrontendContext) {
     if (state!.openingStatus && state!.openingStatus !== 'matched') {
       box.appendChild(el('div', 'sc-hint', state!.openingStatus === 'first-message-not-on-screen'
         ? 'Opening greeting not detected: scroll the chat to its first message and refresh (⟳).'
-        : `Opening greeting not detected (${state!.openingStatus}).`))
+        : state!.openingStatus === 'no-match' && state!.openingSample
+          ? `Opening greeting not detected: the first message reads "${state!.openingSample}" and no greeting on this card matches it.`
+          : `Opening greeting not detected (${state!.openingStatus}).`))
     }
     const opening = state!.openingHash ? state!.greetings.find((g) => g.hash === state!.openingHash) ?? null : null
     if (opening && hashes[0] !== opening.hash) {
@@ -512,7 +534,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const fields: Array<{ key: 'label' | 'scene' | 'mood'; label: string; hint: string; single?: boolean }> = [
       { key: 'label', label: 'Label', hint: 'Short name for this stage, e.g. "Riding lesson".', single: true },
       { key: 'scene', label: 'Scene', hint: 'Setting and situation. No dialogue, no {{user}} actions. This goes to the model.' },
-      { key: 'mood', label: 'Mood', hint: 'Tone, plus an explicit ceiling on intimacy or heat for this stage. This goes to the model.' },
+      { key: 'mood', label: 'Mood', hint: 'Tone, plus an intimacy ceiling for the transition message. This goes to the model.' },
     ]
     let contextBox: HTMLElement | null = null
     const renderContext = () => {
@@ -557,12 +579,14 @@ export function setup(ctx: SpindleFrontendContext) {
     const previewTitle = el('div', 'sc-hint', `What the model will see (in-stage wording, names substituted at injection; cap ${DIRECTIVE_TOKEN_CAP} tokens):`)
     previewTitle.style.marginTop = '8px'
     box.appendChild(previewTitle)
-    box.appendChild(previewBox)
+    const currentInstructions = () => instructionsDraft ?? state!.settings.inStageInstructions ?? DEFAULT_IN_STAGE_INSTRUCTIONS
     const updatePreview = () => {
-      const r = renderDirective('in-stage', { ...draft, updatedAt: 0 }, LITERAL_NAMES)
+      const r = renderDirective('in-stage', { ...draft, updatedAt: 0 }, LITERAL_NAMES, { instructions: currentInstructions() })
       const shown = (state!.route?.injectMode ?? 'append-to-last-user') === 'append-to-last-user' ? wrapForAppend(r.text) : r.text
-      previewBox.textContent = shown + (r.truncated ? '\n\n(truncated to fit the cap: shorten scene or mood)' : '')
+      previewBox.textContent = shown + (r.truncated ? '\n\n(truncated to fit the cap: shorten scene, mood or the instructions)' : '')
     }
+    box.appendChild(renderInstructionsEditor(updatePreview))
+    box.appendChild(previewBox)
     updatePreview()
 
     // Distill row
@@ -613,6 +637,68 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     box.appendChild(arow)
     root.appendChild(box)
+  }
+
+  /**
+   * Editor for the standing instructions that follow scene and mood in every
+   * in-stage note. One setting for all cards and chats, saved on blur so the
+   * re-render from the backend does not steal focus mid-sentence.
+   */
+  function renderInstructionsEditor(onChange: () => void): HTMLElement {
+    const wrap = el('div', 'sc-instructions')
+    const saved = state!.settings.inStageInstructions ?? null
+    const customised = saved !== null && saved !== DEFAULT_IN_STAGE_INSTRUCTIONS
+    const row = el('div', 'sc-row')
+    row.appendChild(button(instructionsOpen ? 'Hide the instructions' : 'Edit the instructions', () => {
+      instructionsOpen = !instructionsOpen
+      if (!instructionsOpen) instructionsDraft = null
+      render()
+    }, { title: 'Change the standing instructions after scene and mood' }))
+    if (customised) row.appendChild(el('span', 'sc-badge sc-ok', 'customized'))
+    wrap.appendChild(row)
+    if (!instructionsOpen) return wrap
+
+    const field = el('div', 'sc-field')
+    const ta = el('textarea')
+    ta.value = instructionsDraft ?? saved ?? DEFAULT_IN_STAGE_INSTRUCTIONS
+    ta.maxLength = INSTRUCTIONS_MAX_CHARS
+    ta.rows = 4
+    const meter = el('div', 'sc-hint')
+    const updateMeter = () => {
+      meter.textContent = `~${estimateTokens(effectiveInstructions(ta.value))} tokens of the ${DIRECTIVE_TOKEN_CAP} shared with scene and mood`
+    }
+    // Blur (change) and the Done button can both fire for one edit; send each value once.
+    let sent: string | null = saved
+    const save = () => {
+      const next = ta.value.replace(/\s+/g, ' ').trim()
+      const value = next.length === 0 || next === DEFAULT_IN_STAGE_INSTRUCTIONS ? null : next
+      instructionsDraft = null
+      if (value === sent) { render(); return }
+      sent = value
+      send({ type: 'set_settings', chatId: state!.chatId, settings: { inStageInstructions: value } })
+    }
+    const resetBtn = button('Reset to original', () => {
+      ta.value = DEFAULT_IN_STAGE_INSTRUCTIONS
+      instructionsDraft = null
+      onChange()
+      if (sent !== null) { sent = null; send({ type: 'set_settings', chatId: state!.chatId, settings: { inStageInstructions: null } }) }
+      else render()
+    }, { title: 'Put the built-in wording back' })
+    const updateReset = () => { resetBtn.disabled = ta.value.replace(/\s+/g, ' ').trim() === DEFAULT_IN_STAGE_INSTRUCTIONS }
+    ta.addEventListener('input', () => { instructionsDraft = ta.value; updateMeter(); updateReset(); onChange() })
+    ta.addEventListener('change', save)
+    field.appendChild(ta)
+    updateMeter()
+    field.appendChild(meter)
+    field.appendChild(el('div', 'sc-hint', 'Applies to every stage card, in every chat. Blank means the original. Saved when you click away. In append mode the whole note is wrapped as "(OOC: … Do not reply to this note.)"; that wrapper is fixed.'))
+    const arow = el('div', 'sc-row')
+    arow.style.marginTop = '6px'
+    updateReset()
+    arow.appendChild(resetBtn)
+    arow.appendChild(button('Done', () => { instructionsOpen = false; save() }))
+    field.appendChild(arow)
+    wrap.appendChild(field)
+    return wrap
   }
 
   function renderInjection(route: ChatRoute | null): void {
