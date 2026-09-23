@@ -1,0 +1,14 @@
+{
+  "version": "1.0.0",
+  "name": "Stagecoach",
+  "identifier": "stagecoach",
+  "author": "MissusMeesecks",
+  "github": "https://github.com/MissusMeesecks/Stagecoach",
+  "homepage": "https://github.com/MissusMeesecks/Stagecoach",
+  "description": "Treats a character card's greetings as ordered story stages and soft-steers the roleplay through them, one stage at a time.",
+  "permissions": ["characters", "chats", "interceptor", "generation"],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "interceptorTimeoutMs": 5000,
+  "minimum_lumiverse_version": "1.1.0"
+}
