@@ -8,7 +8,7 @@ Stagecoach is an independent, unofficial community extension and is not affiliat
 
 ## Why
 
-Plenty of cards write their alternate greetings as sequels ("two weeks later…") rather than alternatives. Picking one means a fresh chat with none of the history. Stagecoach lets you play them in any order, in one chat.
+Many cards write their alternate greetings as sequels ("two weeks later…") rather than alternatives. Picking one means a fresh chat with none of the history. Stagecoach lets you play them in any order, in one chat.
 
 ![Stagecoach panel on a demo card: a three-stage route (Slow ranch dusk, Fences repaired, Hearthside evening), currently on stage 2 with a scene-change note queued for the next reply. Each later stage has its own "Way in" transition style.](docs/img/stage-editor.png)
 
