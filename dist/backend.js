@@ -23,35 +23,47 @@ function isValidHash(hash) {
 
 // src/core/tiers.ts
 var ARRIVAL_TURNS = 1;
-function highestHistoryIndex(messages) {
-  let max = null;
-  for (const m of messages) {
-    if (m.__isChatHistory !== true)
-      continue;
-    if (typeof m.sourceIndexInChat !== "number" || !Number.isFinite(m.sourceIndexInChat))
-      continue;
-    if (max === null || m.sourceIndexInChat > max)
-      max = m.sourceIndexInChat;
+function hasText(content) {
+  if (typeof content === "string")
+    return content.trim().length > 0;
+  if (Array.isArray(content))
+    return content.some((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.trim().length > 0);
+  return false;
+}
+function isLandedReply(m, excludeId) {
+  if (m.__isChatHistory !== true || m.role !== "assistant")
+    return false;
+  if (excludeId && m.sourceMessageId === excludeId)
+    return false;
+  return hasText(m.content);
+}
+function repliesSince(messages, input) {
+  const hist = messages.filter((m) => m.__isChatHistory === true);
+  if (input.anchorId) {
+    const at = hist.findIndex((m) => m.sourceMessageId === input.anchorId);
+    if (at !== -1) {
+      let replies = 0;
+      for (let i = at + 1;i < hist.length; i++)
+        if (isLandedReply(hist[i], input.excludeId))
+          replies++;
+      return { replies, by: "anchor" };
+    }
   }
-  return max;
-}
-function countHistoryMessages(messages) {
-  let n = 0;
-  for (const m of messages)
-    if (m.__isChatHistory === true)
-      n++;
-  return n;
-}
-function turnsInStage(currentIndex, enteredAt) {
-  return Math.max(0, Math.floor((currentIndex - enteredAt) / 2));
+  const indexed = hist.some((m) => typeof m.sourceIndexInChat === "number" && Number.isFinite(m.sourceIndexInChat));
+  let replies = 0;
+  hist.forEach((m, pos) => {
+    const idx = indexed && typeof m.sourceIndexInChat === "number" ? m.sourceIndexInChat : pos;
+    if (idx >= input.enteredAt && isLandedReply(m, input.excludeId))
+      replies++;
+  });
+  return { replies, by: indexed ? "index" : "position" };
 }
 var DEFAULT_REMINDER_EVERY = 0;
 var MAX_REMINDER_EVERY = 10;
 function reminderDue(input) {
   if (input.stageIndex <= 0)
     return false;
-  const turns = turnsInStage(input.currentIndex, input.enteredAt ?? 0);
-  const since = turns - ARRIVAL_TURNS;
+  const since = input.replies - ARRIVAL_TURNS;
   if (since < 0)
     return true;
   const every = Math.floor(input.every);
@@ -60,12 +72,12 @@ function reminderDue(input) {
   return since % every === 0;
 }
 function chooseTier(input) {
-  const { stageIndex, enteredAt, currentIndex } = input;
+  const { stageIndex, enteredAt, replies } = input;
   if (stageIndex <= 0)
     return "in-stage";
   if (enteredAt === undefined)
     return "in-stage";
-  return turnsInStage(currentIndex, enteredAt) < ARRIVAL_TURNS ? "arrival" : "in-stage";
+  return replies < ARRIVAL_TURNS ? "arrival" : "in-stage";
 }
 
 // src/core/templates.ts
@@ -107,16 +119,24 @@ function effectiveInstructions(custom) {
   const t = custom ? clean(custom) : "";
   return t.length > 0 ? t : DEFAULT_IN_STAGE_INSTRUCTIONS;
 }
-function frame(tier, style, scene, mood, instructions) {
-  return tier === "arrival" ? `${arrivalFrame(style, scene, mood)} ${TENSE_NOTE}` : `${scene} Mood: ${mood} ${instructions}`;
+function partnerLine(char, partner) {
+  return partner ? ` This scene is between ${char} and ${partner}.` : "";
+}
+function frame(tier, style, scene, mood, instructions, partner) {
+  const where = `${scene}${partner}`;
+  return tier === "arrival" ? `${arrivalFrame(style, where, mood)} ${TENSE_NOTE}` : `${where} Mood: ${mood} ${instructions}`;
 }
 function renderDirective(tier, card, names, options = {}) {
   const style = effectiveTransition(options.transition);
   const capChars = (options.tokenCap ?? DIRECTIVE_TOKEN_CAP) * 4;
-  let scene = clean(substituteNames(card.scene, names));
-  let mood = clean(substituteNames(card.mood, names));
+  const withField = options.group ? clean(card.with ?? "") || "{{user}}" : "";
+  const partnerName = clean(substituteNames(withField, names));
+  const cardNames = options.group && partnerName && partnerName !== names.user ? { ...names, user: partnerName } : names;
+  let scene = clean(substituteNames(card.scene, cardNames));
+  let mood = clean(substituteNames(card.mood, cardNames));
   const instructions = effectiveInstructions(options.instructions);
-  let body = frame(tier, style, scene, mood, instructions);
+  const partner = partnerLine(names.char, partnerName);
+  let body = frame(tier, style, scene, mood, instructions, partner);
   let truncated = false;
   if (body.length > capChars) {
     const frameLen = body.length - scene.length - mood.length;
@@ -126,7 +146,7 @@ function renderDirective(tier, card, names, options = {}) {
     if (scene.length + mood.length > budget)
       scene = truncateToChars(scene, Math.max(24, budget - mood.length));
     truncated = true;
-    body = frame(tier, style, scene, mood, instructions);
+    body = frame(tier, style, scene, mood, instructions, partner);
     if (body.length > capChars)
       body = truncateToChars(body, capChars);
   }
@@ -203,7 +223,23 @@ function sample(text, max = 90) {
   return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t;
 }
 
+// src/core/group.ts
+function groupInfo(metadata, characterId) {
+  const meta = metadata && typeof metadata === "object" ? metadata : {};
+  const ids = Array.isArray(meta.character_ids) ? meta.character_ids.filter((v) => typeof v === "string" && v.length > 0) : [];
+  const isGroup = meta.group === true && ids.length > 0;
+  const memberIds = isGroup ? [characterId, ...ids.filter((id) => id !== characterId)] : [characterId];
+  const agi = meta.activeGreetingIndex;
+  const activeGreetingIndex = typeof agi === "number" && Number.isFinite(agi) && agi >= 0 ? Math.floor(agi) : null;
+  return { isGroup, memberIds, activeGreetingIndex };
+}
+
 // src/core/inject.ts
+function hasText2(content) {
+  if (typeof content === "string")
+    return content.trim().length > 0;
+  return Array.isArray(content) && content.some((p) => typeof p.text === "string" && p.text.trim().length > 0);
+}
 function historyIndices(messages) {
   const out = [];
   messages.forEach((m, i) => {
@@ -232,17 +268,11 @@ function injectSystemAtDepth(messages, directive, depth) {
 function wrapForAppend(directive) {
   return `(OOC: ${directive} Do not reply to this note.)`;
 }
-function appendToLastUser(messages, directive) {
-  let idx = -1;
-  for (let i = messages.length - 1;i >= 0; i--) {
-    const m = messages[i];
-    if (m.__isChatHistory === true && m.role === "user") {
-      idx = i;
-      break;
-    }
-  }
-  if (idx === -1)
-    return injectSystemAtDepth(messages, directive, 0);
+function appendToLastUser(messages, directive, fallbackDepth = 0) {
+  const hist = historyIndices(messages).filter((i) => hasText2(messages[i].content));
+  const idx = hist.length > 0 ? hist[hist.length - 1] : -1;
+  if (idx === -1 || messages[idx].role !== "user")
+    return injectSystemAtDepth(messages, directive, fallbackDepth);
   const src = messages[idx];
   const sep = `
 
@@ -261,7 +291,7 @@ function appendToLastUser(messages, directive) {
   return { messages: out, injectedIndex: null, appliedMode: "append-to-last-user" };
 }
 function injectDirective(messages, directive, mode, depth) {
-  return mode === "append-to-last-user" ? appendToLastUser(messages, directive) : injectSystemAtDepth(messages, directive, depth);
+  return mode === "append-to-last-user" ? appendToLastUser(messages, directive, depth) : injectSystemAtDepth(messages, directive, depth);
 }
 
 // src/core/route.ts
@@ -303,6 +333,12 @@ function normalizeRoute(raw, chatId, characterId) {
         transitions[hash] = style;
     }
   }
+  const anchors = {};
+  if (r.anchors && typeof r.anchors === "object") {
+    for (const [k, v] of Object.entries(r.anchors))
+      if (/^\d+$/.test(k) && typeof v === "string" && v)
+        anchors[k] = v;
+  }
   return {
     ...base,
     characterId: typeof r.characterId === "string" && r.characterId ? r.characterId : characterId,
@@ -313,7 +349,9 @@ function normalizeRoute(raw, chatId, characterId) {
     strength,
     timing: r.timing && typeof r.timing === "object" ? r.timing : undefined,
     injectMode,
-    transitions: Object.keys(transitions).length ? transitions : undefined
+    transitions: Object.keys(transitions).length ? transitions : undefined,
+    anchors: Object.keys(anchors).length ? anchors : undefined,
+    skipNote: r.skipNote === true ? true : undefined
   };
 }
 function transitionFor(route, hash) {
@@ -330,15 +368,42 @@ function setTransition(route, hash, style) {
     transitions[hash] = style;
   return { ...route, transitions: Object.keys(transitions).length ? transitions : undefined };
 }
-function setStage(route, stageIndex, messageCount) {
+function setStage(route, stageIndex, messageCount, latestMessageId) {
   const maxIndex = Math.max(0, route.route.length - 1);
   const target = Math.min(maxIndex, Math.max(0, Math.floor(stageIndex)));
   const enteredAt = route.enteredAt.slice(0, Math.min(route.enteredAt.length, target + 1));
   if (enteredAt.length === 0)
     enteredAt.push(0);
-  while (enteredAt.length < target + 1)
+  const anchors = {};
+  for (const [k, v] of Object.entries(route.anchors ?? {}))
+    if (Number(k) < enteredAt.length)
+      anchors[k] = v;
+  while (enteredAt.length < target + 1) {
+    if (latestMessageId)
+      anchors[String(enteredAt.length)] = latestMessageId;
     enteredAt.push(Math.max(0, Math.floor(messageCount)));
-  return { ...route, stageIndex: target, enteredAt };
+  }
+  return { ...route, stageIndex: target, enteredAt, anchors: Object.keys(anchors).length ? anchors : undefined, skipNote: undefined };
+}
+function replayStage(route, messageCount, latestMessageId) {
+  if (route.stageIndex <= 0 || route.route.length === 0)
+    return route;
+  const enteredAt = [...route.enteredAt];
+  while (enteredAt.length < route.stageIndex + 1)
+    enteredAt.push(enteredAt[enteredAt.length - 1] ?? 0);
+  enteredAt[route.stageIndex] = Math.max(0, Math.floor(messageCount));
+  const anchors = { ...route.anchors ?? {} };
+  if (latestMessageId)
+    anchors[String(route.stageIndex)] = latestMessageId;
+  else
+    delete anchors[String(route.stageIndex)];
+  return { ...route, enteredAt, anchors: Object.keys(anchors).length ? anchors : undefined, skipNote: undefined };
+}
+function skipNote(route) {
+  return route.stageIndex <= 0 ? route : { ...route, skipNote: true };
+}
+function anchorFor(route) {
+  return route.anchors?.[String(route.stageIndex)] ?? null;
 }
 function applyRoute(route, hashes, messageCount) {
   const unique = [];
@@ -512,6 +577,7 @@ function sanitizeCard(raw, hash) {
     scene: str(r.scene),
     mood: str(r.mood),
     doneWhen: str(r.doneWhen),
+    with: str(r.with),
     source,
     updatedAt
   };
@@ -544,6 +610,36 @@ async function getCharacter(characterId, userId) {
   characterCache.set(characterId, character);
   return character;
 }
+var greetingsCache = new Map;
+async function chatGreetings(chat, userId) {
+  const cached = greetingsCache.get(chat.id);
+  if (cached)
+    return cached;
+  const info = groupInfo(chat.metadata, chat.character_id);
+  const greetings = [];
+  const members = [];
+  const seen = new Set;
+  for (const id of info.memberIds) {
+    const character = await getCharacter(id, userId);
+    if (!character) {
+      if (id === chat.character_id)
+        return null;
+      spindle.log.warn(`${LOG} group member ${id} could not be loaded; its greetings are skipped`);
+      continue;
+    }
+    members.push({ id, name: character.name });
+    for (const g of greetingTexts(character)) {
+      const hash = await hashGreeting(g.text);
+      if (seen.has(hash))
+        continue;
+      seen.add(hash);
+      greetings.push({ index: g.index, hash, text: g.text, characterId: id, characterName: character.name });
+    }
+  }
+  const pooled = { greetings, members };
+  greetingsCache.set(chat.id, pooled);
+  return pooled;
+}
 function greetingTexts(character) {
   const out = [];
   if (typeof character.first_mes === "string" && character.first_mes.trim())
@@ -554,12 +650,6 @@ function greetingTexts(character) {
       out.push({ index: i + 1, text });
   });
   return out;
-}
-async function resolveCharacterId(chatId, hint, userId) {
-  if (typeof hint === "string" && hint)
-    return hint;
-  const chat = await getChat(chatId, userId);
-  return chat?.character_id ?? null;
 }
 async function resolveOne(macro, chatId, characterId, userId) {
   try {
@@ -577,19 +667,20 @@ async function resolveOne(macro, chatId, characterId, userId) {
     return null;
   }
 }
-async function resolveNames(chatId, characterId, userId) {
-  const cached = namesCache.get(chatId);
+async function resolveNames(chatId, characterId, userId, preferRecord = false) {
+  const cacheKey = `${chatId}:${characterId ?? ""}:${preferRecord ? "r" : "m"}`;
+  const cached = namesCache.get(cacheKey);
   if (cached)
     return cached;
   const [charName, userName] = await Promise.all([
-    resolveOne("{{char}}", chatId, characterId, userId),
+    preferRecord ? Promise.resolve(null) : resolveOne("{{char}}", chatId, characterId, userId),
     resolveOne("{{user}}", chatId, characterId, userId)
   ]);
   let char = charName;
   if (!char && characterId)
     char = (await getCharacter(characterId, userId))?.name ?? null;
   const names = { char: char ?? "the character", user: userName ?? "the user" };
-  namesCache.set(chatId, names);
+  namesCache.set(cacheKey, names);
   return names;
 }
 var interceptorRegistered = false;
@@ -615,27 +706,37 @@ function tryRegisterInterceptor() {
         return messages;
       if (!card.scene && !card.mood)
         return messages;
-      let currentIndex = highestHistoryIndex(messages);
-      if (currentIndex === null) {
-        currentIndex = Math.max(0, countHistoryMessages(messages) - 1);
-        if (!fallbackIndexLogged.has(chatId)) {
-          fallbackIndexLogged.add(chatId);
-          spindle.log.warn(`${LOG} sourceIndexInChat absent on history messages for chat ${chatId}; falling back to message count`);
-        }
+      const enteredAt = route.enteredAt[route.stageIndex];
+      const anchorId = anchorFor(route);
+      const counted = repliesSince(messages, { anchorId, enteredAt: enteredAt ?? 0, excludeId: context.excludeMessageId ?? null });
+      if (counted.by === "position" && !fallbackIndexLogged.has(chatId)) {
+        fallbackIndexLogged.add(chatId);
+        spindle.log.warn(`${LOG} sourceIndexInChat absent on history messages for chat ${chatId}; counting replies by position`);
       }
-      const tier = chooseTier({
-        stageIndex: route.stageIndex,
-        stageCount: route.route.length,
-        enteredAt: route.enteredAt[route.stageIndex],
-        currentIndex
-      });
-      const due = reminderDue({ stageIndex: route.stageIndex, enteredAt: route.enteredAt[route.stageIndex], currentIndex, every: reminderEveryFor(route) });
+      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt, replies: counted.replies });
+      const due = reminderDue({ stageIndex: route.stageIndex, replies: counted.replies, every: reminderEveryFor(route) });
+      const tail = messages.filter((m) => m.__isChatHistory === true).slice(-4).map((m) => `${m.role}#${m.sourceIndexInChat ?? "?"}${anchorId && m.sourceMessageId === anchorId ? "*" : ""}(${typeof m.content === "string" ? m.content.length : "parts"})`).join(" ");
+      spindle.log.info(`${LOG} ${context.generationType}${context.isDryRun ? " dry-run" : ""} chat ${chatId} stage ${route.stageIndex + 1}: replies since entry ${counted.replies} by ${counted.by}${anchorId ? "" : " (no anchor)"}, ${due ? `${tier} note` : "no note"}; tail ${tail}${context.excludeMessageId ? ` exclude ${context.excludeMessageId}` : ""}`);
       if (!due)
         return messages;
-      const names = await resolveNames(chatId, context.characterId || route.characterId || null, userId);
+      if (route.skipNote) {
+        spindle.log.info(`${LOG} note skipped by the user for chat ${chatId} stage ${route.stageIndex + 1}`);
+        return messages;
+      }
+      const chat = await getChat(chatId, userId);
+      const pooled = chat ? await chatGreetings(chat, userId) : null;
+      const owner = pooled?.greetings.find((g) => g.hash === stageHash)?.characterId ?? null;
+      const speaker = context.characterId || route.characterId || null;
+      const isGroup = chat ? groupInfo(chat.metadata, chat.character_id).isGroup : false;
+      const names = await resolveNames(chatId, owner ?? speaker, userId, isGroup || owner !== null && owner !== speaker);
       const settings = await loadSettings(userId);
-      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash), instructions: settings.inStageInstructions });
+      const directive = renderDirective(tier, card, names, {
+        transition: transitionFor(route, stageHash),
+        instructions: settings.inStageInstructions,
+        group: isGroup
+      });
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route));
+      spindle.log.info(`${LOG} injected as ${result.appliedMode} (speaker ${speaker ?? "?"}, card owner ${owner ?? "?"})`);
       if (result.injectedIndex === null)
         return { messages: result.messages };
       return {
@@ -658,10 +759,12 @@ spindle.permissions.onChanged(({ permission, granted }) => {
 var onEvent = spindle.on;
 onEvent("CHARACTER_EDITED", () => {
   characterCache.clear();
+  greetingsCache.clear();
   namesCache.clear();
 });
 onEvent("CHARACTER_DELETED", () => {
   characterCache.clear();
+  greetingsCache.clear();
   namesCache.clear();
 });
 onEvent("PERSONA_CHANGED", () => {
@@ -691,8 +794,10 @@ onEvent("CHAT_FORKED", (payload, eventUserId) => {
 });
 onEvent("CHAT_CHANGED", (payload) => {
   const id = payload?.chat?.id;
-  if (typeof id === "string")
+  if (typeof id === "string") {
     chatCache.delete(id);
+    greetingsCache.delete(id);
+  }
 });
 async function listConnections(userId) {
   if (!has("generation"))
@@ -765,16 +870,19 @@ async function buildPanelState(chatId, userId, openingText, openingProbe, openin
     return state;
   }
   state.characterId = chat.character_id;
-  const character = await getCharacter(chat.character_id, userId);
-  if (!character) {
+  const pooled = await chatGreetings(chat, userId);
+  if (!pooled) {
     state.error = has("characters") ? "Could not load the character for this chat." : 'The "characters" permission is required to read greetings.';
   } else {
-    state.characterName = character.name;
-    const greetings = [];
-    for (const g of greetingTexts(character)) {
-      const hash = await hashGreeting(g.text);
-      greetings.push({ index: g.index, hash, text: g.text, card: await loadCard(hash, userId) });
+    const info = groupInfo(chat.metadata, chat.character_id);
+    state.characterName = pooled.members[0]?.name ?? null;
+    if (info.isGroup) {
+      state.isGroup = true;
+      state.members = pooled.members;
     }
+    const greetings = [];
+    for (const g of pooled.greetings)
+      greetings.push({ ...g, card: await loadCard(g.hash, userId) });
     state.greetings = greetings;
     const readings = [openingText, ...openingCandidates ?? []].filter((t) => typeof t === "string" && t.trim().length > 0);
     if (readings.length > 0) {
@@ -785,6 +893,15 @@ async function buildPanelState(chatId, userId, openingText, openingProbe, openin
       spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (${readings.length} readings, first ${readings[0].length} chars starting "${sample(readings[0], 60)}", ${greetings.length} greetings)`);
     } else {
       state.openingStatus = openingProbe ?? "no-text";
+    }
+    if (!state.openingHash && info.activeGreetingIndex !== null) {
+      const byIndex = greetings.find((g) => g.characterId === chat.character_id && g.index === info.activeGreetingIndex);
+      if (byIndex) {
+        state.openingHash = byIndex.hash;
+        state.openingStatus = "matched";
+        delete state.openingSample;
+        spindle.log.info(`${LOG} opening greeting taken from chat metadata (activeGreetingIndex ${info.activeGreetingIndex}) for chat ${chatId}`);
+      }
     }
   }
   state.route = await loadRoute(chatId, userId);
@@ -870,17 +987,13 @@ function parseStageJson(text) {
 async function distill(chatId, hash, connectionId, userId) {
   if (!has("generation"))
     throw new Error('The "generation" permission is required for Distill.');
-  const characterId = await resolveCharacterId(chatId, null, userId);
-  const character = characterId ? await getCharacter(characterId, userId) : null;
-  if (!character)
+  const chat = await getChat(chatId, userId);
+  const pooled = chat ? await chatGreetings(chat, userId) : null;
+  if (!pooled)
     throw new Error("Could not load the character for this chat.");
-  let greeting = null;
-  for (const g of greetingTexts(character)) {
-    if (await hashGreeting(g.text) === hash) {
-      greeting = g.text;
-      break;
-    }
-  }
+  const owned = pooled.greetings.find((g) => g.hash === hash) ?? null;
+  const greeting = owned?.text ?? null;
+  const characterId = owned?.characterId ?? chat.character_id;
   if (!greeting)
     throw new Error("That greeting is no longer on the character (it may have been edited).");
   let model;
@@ -972,7 +1085,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const route = await routeForWrite(msg.chatId, uid);
         if (!route)
           throw new Error("Could not load this chat.");
-        await saveRoute(setStage(route, Number(msg.stageIndex) || 0, Number(msg.messageCount) || 0), uid);
+        await saveRoute(setStage(route, Number(msg.stageIndex) || 0, Number(msg.messageCount) || 0, typeof msg.latestMessageId === "string" ? msg.latestMessageId : null), uid);
+        await pushStateFor(msg.chatId, uid);
+        break;
+      }
+      case "set_note": {
+        const route = await routeForWrite(msg.chatId, uid);
+        if (!route)
+          throw new Error("Could not load this chat.");
+        const next = msg.armed ? replayStage(route, Number(msg.messageCount) || 0, typeof msg.latestMessageId === "string" ? msg.latestMessageId : null) : skipNote(route);
+        await saveRoute(next, uid);
         await pushStateFor(msg.chatId, uid);
         break;
       }

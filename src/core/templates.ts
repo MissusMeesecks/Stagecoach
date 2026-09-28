@@ -81,10 +81,16 @@ export function effectiveInstructions(custom: string | null | undefined): string
   return t.length > 0 ? t : DEFAULT_IN_STAGE_INSTRUCTIONS
 }
 
-function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string, instructions: string): string {
+/** Named scene partner, when the card says the scene is not with {{user}}. Rides with the scene, outside the trim budget. */
+export function partnerLine(char: string, partner: string): string {
+  return partner ? ` This scene is between ${char} and ${partner}.` : ''
+}
+
+function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string, instructions: string, partner: string): string {
+  const where = `${scene}${partner}`
   return tier === 'arrival'
-    ? `${arrivalFrame(style, scene, mood)} ${TENSE_NOTE}`
-    : `${scene} Mood: ${mood} ${instructions}`
+    ? `${arrivalFrame(style, where, mood)} ${TENSE_NOTE}`
+    : `${where} Mood: ${mood} ${instructions}`
 }
 
 export interface RenderOptions {
@@ -92,6 +98,14 @@ export interface RenderOptions {
   tokenCap?: number
   /** Replaces DEFAULT_IN_STAGE_INSTRUCTIONS in in-stage notes. Arrival notes ignore it. */
   instructions?: string | null
+  /**
+   * Group chat. The card's `with` field is honoured only here: the partner line
+   * always appears ({{user}} when `with` is blank), and naming another
+   * character makes {{user}} in the card's scene and mood mean them. Solo
+   * chats ignore `with` entirely, so a card shared with a group cannot steer
+   * a solo chat by accident.
+   */
+  group?: boolean
 }
 
 export interface RenderedDirective {
@@ -103,12 +117,16 @@ export interface RenderedDirective {
 export function renderDirective(tier: Tier, card: StageCard, names: Names, options: RenderOptions = {}): RenderedDirective {
   const style = effectiveTransition(options.transition)
   const capChars = (options.tokenCap ?? DIRECTIVE_TOKEN_CAP) * 4
-  let scene = clean(substituteNames(card.scene, names))
-  let mood = clean(substituteNames(card.mood, names))
-
+  const withField = options.group ? clean(card.with ?? '') || '{{user}}' : ''
+  const partnerName = clean(substituteNames(withField, names))
+  // In a group, a card that names another character as the scene partner means "{{user}}" in the card's own text is them.
+  const cardNames: Names = options.group && partnerName && partnerName !== names.user ? { ...names, user: partnerName } : names
+  let scene = clean(substituteNames(card.scene, cardNames))
+  let mood = clean(substituteNames(card.mood, cardNames))
   const instructions = effectiveInstructions(options.instructions)
+  const partner = partnerLine(names.char, partnerName)
 
-  let body = frame(tier, style, scene, mood, instructions)
+  let body = frame(tier, style, scene, mood, instructions, partner)
   let truncated = false
   if (body.length > capChars) {
     // Trim the two card fields, mood first, until the frame fits.
@@ -117,7 +135,7 @@ export function renderDirective(tier: Tier, card: StageCard, names: Names, optio
     if (scene.length + mood.length > budget) mood = truncateToChars(mood, Math.max(24, Math.floor(budget * 0.35)))
     if (scene.length + mood.length > budget) scene = truncateToChars(scene, Math.max(24, budget - mood.length))
     truncated = true
-    body = frame(tier, style, scene, mood, instructions)
+    body = frame(tier, style, scene, mood, instructions, partner)
     if (body.length > capChars) body = truncateToChars(body, capChars)
   }
 

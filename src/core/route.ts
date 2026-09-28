@@ -52,6 +52,10 @@ export function normalizeRoute(raw: unknown, chatId: string, characterId: string
       if (route.includes(hash) && isTransitionStyle(style) && style !== 'auto' && style !== 'elapse') transitions[hash] = style
     }
   }
+  const anchors: Record<string, string> = {}
+  if (r.anchors && typeof r.anchors === 'object') {
+    for (const [k, v] of Object.entries(r.anchors)) if (/^\d+$/.test(k) && typeof v === 'string' && v) anchors[k] = v
+  }
   return {
     ...base,
     characterId: typeof r.characterId === 'string' && r.characterId ? r.characterId : characterId,
@@ -63,6 +67,8 @@ export function normalizeRoute(raw: unknown, chatId: string, characterId: string
     timing: r.timing && typeof r.timing === 'object' ? r.timing : undefined,
     injectMode,
     transitions: Object.keys(transitions).length ? transitions : undefined,
+    anchors: Object.keys(anchors).length ? anchors : undefined,
+    skipNote: r.skipNote === true ? true : undefined,
   }
 }
 
@@ -81,16 +87,48 @@ export function setTransition(route: ChatRoute, hash: string, style: TransitionS
 
 /**
  * Move the pointer to `stageIndex`. Moving forward records `messageCount` as
- * the entry index of every stage passed; moving back forgets the entries of
+ * the entry index of every stage passed, and `latestMessageId` as the anchor
+ * the interceptor counts replies after; moving back forgets the entries of
  * the stages left, so returning to a stage later counts as a fresh arrival.
  */
-export function setStage(route: ChatRoute, stageIndex: number, messageCount: number): ChatRoute {
+export function setStage(route: ChatRoute, stageIndex: number, messageCount: number, latestMessageId?: string | null): ChatRoute {
   const maxIndex = Math.max(0, route.route.length - 1)
   const target = Math.min(maxIndex, Math.max(0, Math.floor(stageIndex)))
   const enteredAt = route.enteredAt.slice(0, Math.min(route.enteredAt.length, target + 1))
   if (enteredAt.length === 0) enteredAt.push(0)
-  while (enteredAt.length < target + 1) enteredAt.push(Math.max(0, Math.floor(messageCount)))
-  return { ...route, stageIndex: target, enteredAt }
+  const anchors: Record<string, string> = {}
+  for (const [k, v] of Object.entries(route.anchors ?? {})) if (Number(k) < enteredAt.length) anchors[k] = v
+  while (enteredAt.length < target + 1) {
+    if (latestMessageId) anchors[String(enteredAt.length)] = latestMessageId
+    enteredAt.push(Math.max(0, Math.floor(messageCount)))
+  }
+  return { ...route, stageIndex: target, enteredAt, anchors: Object.keys(anchors).length ? anchors : undefined, skipNote: undefined }
+}
+
+/**
+ * Re-enter the current stage without moving: the entry record and anchor are
+ * replaced, so the next reply gets the scene-change note again. Back exists to
+ * undo an Advance silently; this is the deliberate "replay the scene" action.
+ * Stage 1 never gets a note, so replaying it is a no-op.
+ */
+export function replayStage(route: ChatRoute, messageCount: number, latestMessageId?: string | null): ChatRoute {
+  if (route.stageIndex <= 0 || route.route.length === 0) return route
+  const enteredAt = [...route.enteredAt]
+  while (enteredAt.length < route.stageIndex + 1) enteredAt.push(enteredAt[enteredAt.length - 1] ?? 0)
+  enteredAt[route.stageIndex] = Math.max(0, Math.floor(messageCount))
+  const anchors = { ...(route.anchors ?? {}) }
+  if (latestMessageId) anchors[String(route.stageIndex)] = latestMessageId
+  else delete anchors[String(route.stageIndex)]
+  return { ...route, enteredAt, anchors: Object.keys(anchors).length ? anchors : undefined, skipNote: undefined }
+}
+
+/** "Skip this note": the current stage entry sends nothing. Any pointer move or replay clears it. */
+export function skipNote(route: ChatRoute): ChatRoute {
+  return route.stageIndex <= 0 ? route : { ...route, skipNote: true }
+}
+
+export function anchorFor(route: ChatRoute): string | null {
+  return route.anchors?.[String(route.stageIndex)] ?? null
 }
 
 /** Replace the ordered hash list, keeping the pointer on the same card where possible. */

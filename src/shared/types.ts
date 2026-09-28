@@ -16,6 +16,8 @@ export interface StageCard {
   mood: string
   /** Observable narrative condition for the scene feeling finished. */
   doneWhen: string
+  /** Who {{char}} shares this scene with. Empty = {{user}}. A name (group member or anyone) otherwise. */
+  with?: string
   source: 'llm' | 'manual' | 'edited'
   updatedAt: number
 }
@@ -51,6 +53,10 @@ export interface ChatRoute {
   injectMode: InjectMode
   /** Transition style keyed by the hash of the stage being entered. Absent = 'auto'. */
   transitions?: Record<string, TransitionStyle>
+  /** Latest message id when each stage was entered, keyed by stage index. The interceptor counts replies after it. */
+  anchors?: Record<string, string>
+  /** User pressed "Skip this note": no note for the current stage entry. Cleared by any pointer move or by "Send scene note". */
+  skipNote?: boolean
 }
 
 /** One greeting on the active character, as shown in the panel. */
@@ -62,6 +68,9 @@ export interface GreetingInfo {
   text: string
   /** Stage card if one has been saved for this hash. */
   card: StageCard | null
+  /** Whose card this greeting is on. Set for live greetings; absent for orphaned cards (index -1). */
+  characterId?: string
+  characterName?: string
 }
 
 export interface ConnectionInfo {
@@ -103,6 +112,10 @@ export interface PanelState {
   openingStatus?: string
   /** On 'no-match': a short excerpt of what was read as the first message, so the user can see why. */
   openingSample?: string
+  /** Group chat: greetings are pooled from every member and {{char}} on a card means the card's owner. */
+  isGroup?: boolean
+  /** Group members in host order (the chat's own character first). */
+  members?: Array<{ id: string; name: string }>
   /** Set when the backend could not load the chat/character; shown to the user. */
   error?: string
 }
@@ -115,7 +128,9 @@ export type FrontendMessage =
   | { type: 'sync_count'; chatId: string; messageCount: number }
   | { type: 'set_enabled'; chatId: string; enabled: boolean; messageCount: number }
   | { type: 'set_route'; chatId: string; route: string[]; messageCount: number }
-  | { type: 'set_stage'; chatId: string; stageIndex: number; messageCount: number }
+  | { type: 'set_stage'; chatId: string; stageIndex: number; messageCount: number; latestMessageId?: string | null }
+  /** armed=true re-enters the current stage so its scene-change note goes out on the next reply; armed=false skips it. */
+  | { type: 'set_note'; chatId: string; armed: boolean; messageCount: number; latestMessageId?: string | null }
   | { type: 'set_inject_mode'; chatId: string; injectMode: InjectMode }
   | { type: 'set_depth'; chatId: string; depth: number }
   | { type: 'set_reminder_every'; chatId: string; every: number }

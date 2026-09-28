@@ -23,6 +23,11 @@ export interface InjectResult<M extends MessageLike> {
   appliedMode: InjectMode
 }
 
+function hasText(content: MessageLike['content']): boolean {
+  if (typeof content === 'string') return content.trim().length > 0
+  return Array.isArray(content) && content.some((p) => typeof p.text === 'string' && p.text.trim().length > 0)
+}
+
 function historyIndices(messages: readonly MessageLike[]): number[] {
   const out: number[] = []
   messages.forEach((m, i) => { if (m.__isChatHistory === true) out.push(i) })
@@ -66,16 +71,18 @@ export function wrapForAppend(directive: string): string {
 /**
  * `append-to-last-user`: append the directive to the last user history turn.
  * Safe for strict-alternation chat templates. Content may be an array of parts;
- * a text part is appended in that case. Falls back to system-at-depth 0 when
- * there is no user history turn (e.g. some continue generations).
+ * a text part is appended in that case.
+ *
+ * Falls back to a system message at `fallbackDepth` when the latest history
+ * message is not the user's: in a group chat a member can be asked to speak
+ * without a fresh user turn, and appending to an older user message would
+ * bury the note mid-history, where testing showed it is ignored.
  */
-export function appendToLastUser<M extends MessageLike>(messages: readonly M[], directive: string): InjectResult<M> {
-  let idx = -1
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as M
-    if (m.__isChatHistory === true && m.role === 'user') { idx = i; break }
-  }
-  if (idx === -1) return injectSystemAtDepth(messages, directive, 0)
+export function appendToLastUser<M extends MessageLike>(messages: readonly M[], directive: string, fallbackDepth = 0): InjectResult<M> {
+  // The latest history turn that has any text: an empty assistant row is a placeholder for the reply being written, not a turn.
+  const hist = historyIndices(messages).filter((i) => hasText((messages[i] as M).content))
+  const idx = hist.length > 0 ? (hist[hist.length - 1] as number) : -1
+  if (idx === -1 || (messages[idx] as M).role !== 'user') return injectSystemAtDepth(messages, directive, fallbackDepth)
 
   const src = messages[idx] as M
   const sep = '\n\n'
@@ -95,6 +102,6 @@ export function appendToLastUser<M extends MessageLike>(messages: readonly M[], 
 
 export function injectDirective<M extends MessageLike>(messages: readonly M[], directive: string, mode: InjectMode, depth: number): InjectResult<M> {
   return mode === 'append-to-last-user'
-    ? appendToLastUser(messages, directive)
+    ? appendToLastUser(messages, directive, depth)
     : injectSystemAtDepth(messages, directive, depth)
 }

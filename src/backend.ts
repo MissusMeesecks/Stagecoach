@@ -28,11 +28,12 @@ import type {
 } from './shared/types.ts'
 import { DEFAULT_SETTINGS, INSTRUCTIONS_MAX_CHARS } from './shared/types.ts'
 import { hashGreeting, isValidHash } from './core/hash.ts'
-import { chooseTier, countHistoryMessages, highestHistoryIndex, reminderDue } from './core/tiers.ts'
+import { chooseTier, repliesSince, reminderDue } from './core/tiers.ts'
 import { breakdownName, renderDirective, estimateTokens, DEFAULT_IN_STAGE_INSTRUCTIONS, type Names } from './core/templates.ts'
 import { matchGreeting, sample } from './core/opening.ts'
+import { groupInfo } from './core/group.ts'
 import { injectDirective } from './core/inject.ts'
-import { applyRoute, depthFor, forkRoute, isTransitionStyle, newRoute, normalizeRoute, reminderEveryFor, rewindTo, setDepth, setReminderEvery, setStage, setTransition, transitionFor } from './core/route.ts'
+import { applyRoute, depthFor, forkRoute, isTransitionStyle, newRoute, normalizeRoute, reminderEveryFor, rewindTo, setDepth, setReminderEvery, setStage, setTransition, transitionFor, anchorFor, replayStage, skipNote } from './core/route.ts'
 
 declare const spindle: SpindleAPI
 
@@ -155,6 +156,7 @@ function sanitizeCard(raw: unknown, hash: string): StageCard | null {
     scene: str(r.scene),
     mood: str(r.mood),
     doneWhen: str(r.doneWhen),
+    with: str(r.with),
     source,
     updatedAt,
   }
@@ -183,6 +185,54 @@ async function getCharacter(characterId: string, userId?: string): Promise<Chara
   }
   characterCache.set(characterId, character)
   return character
+}
+
+interface OwnedGreeting {
+  index: number
+  hash: string
+  text: string
+  characterId: string
+  characterName: string
+}
+interface PooledGreetings {
+  greetings: OwnedGreeting[]
+  /** Members in host order, the chat's own character first. Solo chats: one entry. */
+  members: Array<{ id: string; name: string }>
+}
+/** Per chat. Cleared with the character cache and when the chat record changes (membership lives in chat metadata). */
+const greetingsCache = new Map<string, PooledGreetings>()
+
+/**
+ * Every greeting the panel and the interceptor may use for this chat, with
+ * its owner. Group chats pool all members; the same text on two cards keeps
+ * the first owner (hashes are content-addressed, so the card is shared).
+ * Returns null only when the chat's own character cannot be loaded.
+ */
+async function chatGreetings(chat: ChatDTO, userId?: string): Promise<PooledGreetings | null> {
+  const cached = greetingsCache.get(chat.id)
+  if (cached) return cached
+  const info = groupInfo(chat.metadata, chat.character_id)
+  const greetings: OwnedGreeting[] = []
+  const members: Array<{ id: string; name: string }> = []
+  const seen = new Set<string>()
+  for (const id of info.memberIds) {
+    const character = await getCharacter(id, userId)
+    if (!character) {
+      if (id === chat.character_id) return null
+      spindle.log.warn(`${LOG} group member ${id} could not be loaded; its greetings are skipped`)
+      continue
+    }
+    members.push({ id, name: character.name })
+    for (const g of greetingTexts(character)) {
+      const hash = await hashGreeting(g.text)
+      if (seen.has(hash)) continue
+      seen.add(hash)
+      greetings.push({ index: g.index, hash, text: g.text, characterId: id, characterName: character.name })
+    }
+  }
+  const pooled = { greetings, members }
+  greetingsCache.set(chat.id, pooled)
+  return pooled
 }
 
 /** [first_mes, ...alternate_greetings] with original indices; empty entries skipped. */
@@ -222,19 +272,27 @@ async function resolveOne(macro: string, chatId: string, characterId: string | n
   }
 }
 
-async function resolveNames(chatId: string, characterId: string | null, userId?: string): Promise<Names> {
-  const cached = namesCache.get(chatId)
+/**
+ * Names for substitution. Keyed by character too: in a group chat the card's
+ * owner may not be the member generating this reply. `preferRecord` takes the
+ * character record's name over the macro engine, for the case where the
+ * engine would resolve {{char}} to the speaker rather than the owner.
+ */
+async function resolveNames(chatId: string, characterId: string | null, userId?: string, preferRecord = false): Promise<Names> {
+  const cacheKey = `${chatId}:${characterId ?? ''}:${preferRecord ? 'r' : 'm'}`
+  const cached = namesCache.get(cacheKey)
   if (cached) return cached
   const [charName, userName] = await Promise.all([
-    resolveOne('{{char}}', chatId, characterId, userId),
+    preferRecord ? Promise.resolve(null) : resolveOne('{{char}}', chatId, characterId, userId),
     resolveOne('{{user}}', chatId, characterId, userId),
   ])
   let char = charName
   if (!char && characterId) char = (await getCharacter(characterId, userId))?.name ?? null
   const names: Names = { char: char ?? 'the character', user: userName ?? 'the user' }
-  namesCache.set(chatId, names)
+  namesCache.set(cacheKey, names)
   return names
 }
+
 
 // ---------------------------------------------------------------------------
 // Interceptor
@@ -259,29 +317,42 @@ function tryRegisterInterceptor(): void {
       if (!card) return messages
       if (!card.scene && !card.mood) return messages
 
-      let currentIndex = highestHistoryIndex(messages)
-      if (currentIndex === null) {
-        currentIndex = Math.max(0, countHistoryMessages(messages) - 1)
-        if (!fallbackIndexLogged.has(chatId)) {
-          fallbackIndexLogged.add(chatId)
-          spindle.log.warn(`${LOG} sourceIndexInChat absent on history messages for chat ${chatId}; falling back to message count`)
-        }
+      const enteredAt = route.enteredAt[route.stageIndex]
+      const anchorId = anchorFor(route)
+      const counted = repliesSince(messages, { anchorId, enteredAt: enteredAt ?? 0, excludeId: context.excludeMessageId ?? null })
+      if (counted.by === 'position' && !fallbackIndexLogged.has(chatId)) {
+        fallbackIndexLogged.add(chatId)
+        spindle.log.warn(`${LOG} sourceIndexInChat absent on history messages for chat ${chatId}; counting replies by position`)
       }
 
-      const tier = chooseTier({
-        stageIndex: route.stageIndex,
-        stageCount: route.route.length,
-        enteredAt: route.enteredAt[route.stageIndex],
-        currentIndex,
-      })
-
-      const due = reminderDue({ stageIndex: route.stageIndex, enteredAt: route.enteredAt[route.stageIndex], currentIndex, every: reminderEveryFor(route) })
+      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt, replies: counted.replies })
+      const due = reminderDue({ stageIndex: route.stageIndex, replies: counted.replies, every: reminderEveryFor(route) })
+      // One line per generation so a "nothing fired" report can be read off the host log.
+      const tail = messages.filter((m) => m.__isChatHistory === true).slice(-4)
+        .map((m) => `${m.role}#${m.sourceIndexInChat ?? '?'}${anchorId && m.sourceMessageId === anchorId ? '*' : ''}(${typeof m.content === 'string' ? m.content.length : 'parts'})`).join(' ')
+      spindle.log.info(`${LOG} ${context.generationType}${context.isDryRun ? ' dry-run' : ''} chat ${chatId} stage ${route.stageIndex + 1}: replies since entry ${counted.replies} by ${counted.by}${anchorId ? '' : ' (no anchor)'}, ${due ? `${tier} note` : 'no note'}; tail ${tail}${context.excludeMessageId ? ` exclude ${context.excludeMessageId}` : ''}`)
       if (!due) return messages
+      if (route.skipNote) {
+        spindle.log.info(`${LOG} note skipped by the user for chat ${chatId} stage ${route.stageIndex + 1}`)
+        return messages
+      }
 
-      const names = await resolveNames(chatId, context.characterId || route.characterId || null, userId)
+      // {{char}} on a card is the card's owner: in a group the speaker may be another member.
+      const chat = await getChat(chatId, userId)
+      const pooled = chat ? await chatGreetings(chat, userId) : null
+      const owner = pooled?.greetings.find((g) => g.hash === stageHash)?.characterId ?? null
+      const speaker = context.characterId || route.characterId || null
+      const isGroup = chat ? groupInfo(chat.metadata, chat.character_id).isGroup : false
+      // Group chats take names from the character record: the host's card-macro mode may resolve {{char}} to whoever is active.
+      const names = await resolveNames(chatId, owner ?? speaker, userId, isGroup || (owner !== null && owner !== speaker))
       const settings = await loadSettings(userId)
-      const directive = renderDirective(tier, card, names, { transition: transitionFor(route, stageHash), instructions: settings.inStageInstructions })
+      const directive = renderDirective(tier, card, names, {
+        transition: transitionFor(route, stageHash),
+        instructions: settings.inStageInstructions,
+        group: isGroup,
+      })
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route))
+      spindle.log.info(`${LOG} injected as ${result.appliedMode} (speaker ${speaker ?? '?'}, card owner ${owner ?? '?'})`)
 
       if (result.injectedIndex === null) return { messages: result.messages }
       return {
@@ -308,8 +379,8 @@ spindle.permissions.onChanged(({ permission, granted }) => {
 // ---------------------------------------------------------------------------
 const onEvent = spindle.on as unknown as (event: string, handler: (payload: unknown, userId?: string) => void) => () => void
 
-onEvent('CHARACTER_EDITED', () => { characterCache.clear(); namesCache.clear() })
-onEvent('CHARACTER_DELETED', () => { characterCache.clear(); namesCache.clear() })
+onEvent('CHARACTER_EDITED', () => { characterCache.clear(); greetingsCache.clear(); namesCache.clear() })
+onEvent('CHARACTER_DELETED', () => { characterCache.clear(); greetingsCache.clear(); namesCache.clear() })
 onEvent('PERSONA_CHANGED', () => { namesCache.clear(); resolvedGreetingCache.clear() })
 onEvent('CHAT_FORKED', (payload, eventUserId) => {
   void (async () => {
@@ -331,7 +402,7 @@ onEvent('CHAT_FORKED', (payload, eventUserId) => {
 })
 onEvent('CHAT_CHANGED', (payload) => {
   const id = (payload as { chat?: { id?: unknown } } | null)?.chat?.id
-  if (typeof id === 'string') chatCache.delete(id)
+  if (typeof id === 'string') { chatCache.delete(id); greetingsCache.delete(id) }
 })
 
 // ---------------------------------------------------------------------------
@@ -404,16 +475,15 @@ async function buildPanelState(chatId: string | null, userId?: string, openingTe
     return state
   }
   state.characterId = chat.character_id
-  const character = await getCharacter(chat.character_id, userId)
-  if (!character) {
+  const pooled = await chatGreetings(chat, userId)
+  if (!pooled) {
     state.error = has('characters') ? 'Could not load the character for this chat.' : 'The "characters" permission is required to read greetings.'
   } else {
-    state.characterName = character.name
+    const info = groupInfo(chat.metadata, chat.character_id)
+    state.characterName = pooled.members[0]?.name ?? null
+    if (info.isGroup) { state.isGroup = true; state.members = pooled.members }
     const greetings: GreetingInfo[] = []
-    for (const g of greetingTexts(character)) {
-      const hash = await hashGreeting(g.text)
-      greetings.push({ index: g.index, hash, text: g.text, card: await loadCard(hash, userId) })
-    }
+    for (const g of pooled.greetings) greetings.push({ ...g, card: await loadCard(g.hash, userId) })
     state.greetings = greetings
     const readings = [openingText, ...(openingCandidates ?? [])].filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
     if (readings.length > 0) {
@@ -423,6 +493,16 @@ async function buildPanelState(chatId: string | null, userId?: string, openingTe
       spindle.log.info(`${LOG} opening greeting ${state.openingStatus} for chat ${chatId} (${readings.length} readings, first ${readings[0]!.length} chars starting "${sample(readings[0]!, 60)}", ${greetings.length} greetings)`)
     } else {
       state.openingStatus = openingProbe ?? 'no-text'
+    }
+    // The host records which greeting opened the chat; use it when the text could not be matched or read.
+    if (!state.openingHash && info.activeGreetingIndex !== null) {
+      const byIndex = greetings.find((g) => g.characterId === chat.character_id && g.index === info.activeGreetingIndex)
+      if (byIndex) {
+        state.openingHash = byIndex.hash
+        state.openingStatus = 'matched'
+        delete state.openingSample
+        spindle.log.info(`${LOG} opening greeting taken from chat metadata (activeGreetingIndex ${info.activeGreetingIndex}) for chat ${chatId}`)
+      }
     }
   }
   state.route = await loadRoute(chatId, userId)
@@ -509,13 +589,13 @@ function parseStageJson(text: string): Omit<StageCard, 'hash' | 'updatedAt'> {
 
 async function distill(chatId: string, hash: string, connectionId: string | null, userId?: string): Promise<void> {
   if (!has('generation')) throw new Error('The "generation" permission is required for Distill.')
-  const characterId = await resolveCharacterId(chatId, null, userId)
-  const character = characterId ? await getCharacter(characterId, userId) : null
-  if (!character) throw new Error('Could not load the character for this chat.')
-  let greeting: string | null = null
-  for (const g of greetingTexts(character)) {
-    if ((await hashGreeting(g.text)) === hash) { greeting = g.text; break }
-  }
+  const chat = await getChat(chatId, userId)
+  const pooled = chat ? await chatGreetings(chat, userId) : null
+  if (!pooled) throw new Error('Could not load the character for this chat.')
+  // Pooled across group members, so a card owned by any member can be distilled.
+  const owned = pooled.greetings.find((g) => g.hash === hash) ?? null
+  const greeting = owned?.text ?? null
+  const characterId = owned?.characterId ?? chat!.character_id
   if (!greeting) throw new Error('That greeting is no longer on the character (it may have been edited).')
 
   // The host does not always carry the connection's model into a raw call
@@ -613,7 +693,18 @@ spindle.onFrontendMessage(async (payload: unknown, userId: string) => {
       case 'set_stage': {
         const route = await routeForWrite(msg.chatId, uid)
         if (!route) throw new Error('Could not load this chat.')
-        await saveRoute(setStage(route, Number(msg.stageIndex) || 0, Number(msg.messageCount) || 0), uid)
+        await saveRoute(setStage(route, Number(msg.stageIndex) || 0, Number(msg.messageCount) || 0, typeof msg.latestMessageId === 'string' ? msg.latestMessageId : null), uid)
+        await pushStateFor(msg.chatId, uid)
+        break
+      }
+
+      case 'set_note': {
+        const route = await routeForWrite(msg.chatId, uid)
+        if (!route) throw new Error('Could not load this chat.')
+        const next = msg.armed
+          ? replayStage(route, Number(msg.messageCount) || 0, typeof msg.latestMessageId === 'string' ? msg.latestMessageId : null)
+          : skipNote(route)
+        await saveRoute(next, uid)
         await pushStateFor(msg.chatId, uid)
         break
       }

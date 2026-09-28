@@ -10,7 +10,7 @@ Stagecoach is an independent, unofficial community extension and is not affiliat
 
 Many cards write their alternate greetings as sequels ("two weeks later…") rather than alternatives. Picking one means a fresh chat with none of the history. Stagecoach lets you play them in any order, in one chat.
 
-![Stagecoach panel on a demo card: a three-stage route (Slow ranch dusk, Fences repaired, Hearthside evening), currently on stage 2 with a scene-change note queued for the next reply. Each later stage has its own "Way in" transition style.](docs/img/stage-editor.png)
+![Stagecoach panel on a demo card: a three-stage route (Slow ranch dusk, Fences repaired, Hearthside evening), currently on stage 2 with a scene-change note queued for the next reply. Each later stage has its own "Way in" transition style.](docs/img/stage-editor-110.png)
 
 ## Features
  
@@ -35,7 +35,7 @@ Many cards write their alternate greetings as sequels ("two weeks later…") rat
 2. **Add greetings to the route** in story order. Cards that write alternate greetings as "later chapters" work well; parallel alternate greetings may have a janky transition without extra prompt customization.
 3. **Edit each stage** and press **Distill** (or fill the fields in by hand), then **Save**. Aim for about 50 tokens per card, hard cap 90. Keep `{{char}}` and `{{user}}` literal; names are substituted at injection time.
 4. For each stage after the first, pick a **Way in** in the route list. It shapes the one note sent when you advance into that stage.
-5. Play. When a scene feels finished, press **Advance**. The next reply opens the new stage the way you chose.
+5. Play. When a scene feels finished, press **Advance**. The next reply opens the new stage the way you chose. **Back** moves without sending anything. The note button beside them shows what the next reply will get and offers the opposite: **Skip this note** to move on silently, or **Send scene note** to set the current scene up again.
 
 Check the result in Prompt Breakdown (Extras -> Dry Run): in append mode the directive appears at the end of your latest user message; in system mode it is its own block. Either way it contains only the current stage's scene and mood.
 
@@ -45,7 +45,7 @@ Check the result in Prompt Breakdown (Extras -> Dry Run): in append mode the dir
 - **The interceptor is pure.** It reads cached state, splices one message, and returns. No LLM calls, no storage writes, no state changes. Dry runs and prompt previews run it safely.
 - **Later stages never reach the prompt.** The rendering code only receives the current stage card.
 - Impersonate and quiet generations are passed through untouched.
-- **Group chats are not yet supported** - recommend to **DISABLE Stagecoach for group chats**, as currently it's unintentionally injecting when it shouldn't be. This displeases me and will be addressed.
+- **Group chats** (new, please report oddities): greetings from every member are pooled in the panel, with a badge showing whose card each is. `{{char}}` on a card means that card's owner, regardless of the speaking card. Each card has a "Scene is with" field (blank = you) with the other members as quick picks. The scene-change note rides on the first reply after you Advance, whoever gives it; if a member speaks without a fresh message from you, the note goes in as a system message at the fallback depth instead of being appended.
 
 ## Development
 

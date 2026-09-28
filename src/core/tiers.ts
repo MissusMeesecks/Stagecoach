@@ -14,6 +14,66 @@ interface HistoryLike {
   content?: unknown
   __isChatHistory?: boolean
   sourceIndexInChat?: number
+  sourceMessageId?: string
+}
+
+export interface RepliesInput {
+  /** Id of the latest message when the stage was entered (route.anchors). Preferred: immune to index offsets. */
+  anchorId?: string | null
+  /** Message count when the stage was entered (route.enteredAt). Fallback when the anchor is not in the window. */
+  enteredAt: number
+  /** Message the host says to leave out (the one being regenerated or written). Never counts as a reply. */
+  excludeId?: string | null
+}
+
+function hasText(content: unknown): boolean {
+  if (typeof content === 'string') return content.trim().length > 0
+  if (Array.isArray(content)) return content.some((p) => p && typeof p === 'object' && typeof (p as { text?: unknown }).text === 'string' && (p as { text: string }).text.trim().length > 0)
+  return false
+}
+
+/** A character reply that has actually been written: not a placeholder row for the reply now being generated, not the excluded message. */
+export function isLandedReply(m: HistoryLike, excludeId?: string | null): boolean {
+  if (m.__isChatHistory !== true || m.role !== 'assistant') return false
+  if (excludeId && m.sourceMessageId === excludeId) return false
+  return hasText(m.content)
+}
+
+export interface RepliesSince {
+  /** Character replies that landed after the stage was entered. */
+  replies: number
+  /** Which rule counted them. */
+  by: 'anchor' | 'index' | 'position'
+}
+
+/**
+ * How many character replies have landed since the stage was entered. This,
+ * not a turn count, decides the scene-change note: in a group chat members
+ * reply back to back with no user turn between, so "index delta / 2" fired
+ * the note up to three times.
+ *
+ * Anchor first: count assistant history messages after the message that was
+ * latest at Advance. If that message is not in the window (deleted, forked,
+ * truncated away), fall back to `sourceIndexInChat >= enteredAt`, and to
+ * array position when the host did not stamp indices.
+ */
+export function repliesSince(messages: readonly HistoryLike[], input: RepliesInput): RepliesSince {
+  const hist = messages.filter((m) => m.__isChatHistory === true)
+  if (input.anchorId) {
+    const at = hist.findIndex((m) => m.sourceMessageId === input.anchorId)
+    if (at !== -1) {
+      let replies = 0
+      for (let i = at + 1; i < hist.length; i++) if (isLandedReply(hist[i]!, input.excludeId)) replies++
+      return { replies, by: 'anchor' }
+    }
+  }
+  const indexed = hist.some((m) => typeof m.sourceIndexInChat === 'number' && Number.isFinite(m.sourceIndexInChat))
+  let replies = 0
+  hist.forEach((m, pos) => {
+    const idx = indexed && typeof m.sourceIndexInChat === 'number' ? m.sourceIndexInChat : pos
+    if (idx >= input.enteredAt && isLandedReply(m, input.excludeId)) replies++
+  })
+  return { replies, by: indexed ? 'index' : 'position' }
 }
 
 /**
@@ -41,7 +101,7 @@ export function countHistoryMessages(messages: readonly HistoryLike[]): number {
   return n
 }
 
-/** Full user+assistant exchanges since the stage was entered. Never negative. */
+/** Panel-side estimate of replies since entry from a message count alone (the panel cannot see roles). Never negative. */
 export function turnsInStage(currentIndex: number, enteredAt: number): number {
   return Math.max(0, Math.floor((currentIndex - enteredAt) / 2))
 }
@@ -51,7 +111,8 @@ export interface TierInput {
   stageCount: number
   /** enteredAt[stageIndex]; undefined when the route was created before v0 tracked it. */
   enteredAt: number | undefined
-  currentIndex: number
+  /** Character replies since the stage was entered (repliesSince, or the panel's estimate). */
+  replies: number
 }
 
 /** 0 = the in-stage note never repeats. One note per stage, at arrival, is the decided design. */
@@ -60,8 +121,8 @@ export const MAX_REMINDER_EVERY = 10
 
 export interface ReminderInput {
   stageIndex: number
-  enteredAt: number | undefined
-  currentIndex: number
+  /** Character replies since the stage was entered. */
+  replies: number
   every: number
 }
 
@@ -71,12 +132,12 @@ export interface ReminderInput {
  *  - The first reply after an Advance always does (the scene-change note).
  *  - After that, nothing, unless `every` >= 1 asks for an in-stage reminder
  *    every N replies (off by default; a repeated note looped the scene).
- * Depends only on message indices, so swipes and regenerates agree.
+ * A regenerated or swiped reply is not in the prompt, so it counts as the
+ * first reply again and gets the same note.
  */
 export function reminderDue(input: ReminderInput): boolean {
   if (input.stageIndex <= 0) return false
-  const turns = turnsInStage(input.currentIndex, input.enteredAt ?? 0)
-  const since = turns - ARRIVAL_TURNS
+  const since = input.replies - ARRIVAL_TURNS
   if (since < 0) return true
   const every = Math.floor(input.every)
   if (!(every >= 1)) return false
@@ -84,9 +145,9 @@ export function reminderDue(input: ReminderInput): boolean {
 }
 
 export function chooseTier(input: TierInput): Tier {
-  const { stageIndex, enteredAt, currentIndex } = input
+  const { stageIndex, enteredAt, replies } = input
   // The starting stage is never "arrived at": the chat opened there.
   if (stageIndex <= 0) return 'in-stage'
   if (enteredAt === undefined) return 'in-stage'
-  return turnsInStage(currentIndex, enteredAt) < ARRIVAL_TURNS ? 'arrival' : 'in-stage'
+  return replies < ARRIVAL_TURNS ? 'arrival' : 'in-stage'
 }

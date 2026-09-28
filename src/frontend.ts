@@ -79,9 +79,9 @@ function preview(text: string, max = 140): string {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t
 }
 
-/** Only scene and mood reach the prompt, so only they count. */
-function cardTokens(c: Pick<StageCard, 'scene' | 'mood'>): string {
-  return [c.scene, c.mood].join(' ')
+/** Only scene, mood and the scene partner reach the prompt, so only they count. */
+function cardTokens(c: Pick<StageCard, 'scene' | 'mood' | 'with'>): string {
+  return [c.scene, c.mood, c.with ?? ''].join(' ')
 }
 
 export function setup(ctx: SpindleFrontendContext) {
@@ -124,6 +124,19 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function messageCount(): number {
     try { return ctx.messages.listMessageIds().length } catch { return 0 }
+  }
+
+  /** Panel-side view of whether the next reply gets the scene-change note. Same estimate the status line uses. */
+  function noteArmed(route: ChatRoute): boolean {
+    if (route.stageIndex <= 0 || route.skipNote) return false
+    const entered = route.enteredAt[route.stageIndex]
+    const turns = entered === undefined ? 0 : turnsInStage(messageCount(), entered)
+    return reminderDue({ stageIndex: route.stageIndex, replies: turns, every: reminderEveryFor(route) })
+  }
+
+  /** Anchor for "first reply after Advance": the interceptor counts replies after this message. */
+  function latestMessageId(): string | null {
+    try { return ctx.messages.getLatestMessageId() } catch { return null }
   }
 
   /** Text of the chat's first message, for matching the greeting it opened with. Optional host APIs; null when unavailable. */
@@ -356,7 +369,10 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function renderHeader(enabled: boolean): void {
-    const { box } = section(state!.characterName ? `Stagecoach · ${state!.characterName}` : 'Stagecoach')
+    const title = state!.isGroup && state!.members
+      ? `Stagecoach · group: ${state!.members.map((m) => m.name).join(', ')}`
+      : state!.characterName ? `Stagecoach · ${state!.characterName}` : 'Stagecoach'
+    const { box } = section(title)
     const row = el('div', 'sc-row')
     const toggle = el('label', 'sc-toggle')
     const cb = el('input')
@@ -379,14 +395,15 @@ export function setup(ctx: SpindleFrontendContext) {
       const current = stages[route.stageIndex]
       const count = messageCount()
       const entered = route.enteredAt[route.stageIndex]
-      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt: entered, currentIndex: count })
+      // The panel cannot see message roles, so it estimates replies since entry from the count.
       const turns = entered === undefined ? 0 : turnsInStage(count, entered)
-      const due = reminderDue({ stageIndex: route.stageIndex, enteredAt: entered, currentIndex: count, every: reminderEveryFor(route) })
+      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt: entered, replies: turns })
+      const due = !route.skipNote && reminderDue({ stageIndex: route.stageIndex, replies: turns, every: reminderEveryFor(route) })
       const noteLabel = due ? (tier === 'arrival' ? 'scene-change note' : 'in-stage note') : 'no note'
       const isFinal = route.stageIndex >= route.route.length - 1
       const noteDetail = route.stageIndex === 0
         ? (isFinal ? ' (stage 1 is where the chat opened; add more stages to steer)' : ' (stage 1 is where the chat opened; nothing to steer yet)')
-        : due ? '' : isFinal ? ` (final stage; the story is on its own from here)` : ` (turn ${turns} in this stage; press Advance when the scene feels finished)`
+        : due ? '' : route.skipNote ? ' (skipped for this stage)' : isFinal ? ` (final stage; the story is on its own from here)` : ` (turn ${turns} in this stage; press Advance when the scene feels finished)`
       const missingCard = current && !current.card
       status.innerHTML = ''
       status.append(
@@ -413,14 +430,23 @@ export function setup(ctx: SpindleFrontendContext) {
       if (i === route.stageIndex) opt.selected = true
       sel.appendChild(opt)
     })
-    sel.addEventListener('change', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: Number(sel.value), messageCount: messageCount() }))
+    sel.addEventListener('change', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: Number(sel.value), messageCount: messageCount(), latestMessageId: latestMessageId() }))
     row.appendChild(sel)
-    row.appendChild(button('◀ Back', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: route.stageIndex - 1, messageCount: messageCount() }), { disabled: route.stageIndex <= 0 }))
-    row.appendChild(button('Advance ▶', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: route.stageIndex + 1, messageCount: messageCount() }), { primary: true, disabled: route.stageIndex >= route.route.length - 1 }))
+    // Moving the pointer while the extension is off records an entry that never fires; keep the controls locked until it is on.
+    sel.disabled = !route.enabled
+    row.appendChild(button('◀ Back', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: route.stageIndex - 1, messageCount: messageCount(), latestMessageId: latestMessageId() }), { disabled: !route.enabled || route.stageIndex <= 0, title: route.enabled ? undefined : 'Enable Stagecoach for this chat first' }))
+    row.appendChild(button('Advance ▶', () => send({ type: 'set_stage', chatId: state!.chatId!, stageIndex: route.stageIndex + 1, messageCount: messageCount(), latestMessageId: latestMessageId() }), { primary: true, disabled: !route.enabled || route.stageIndex >= route.route.length - 1, title: route.enabled ? undefined : 'Enable Stagecoach for this chat first' }))
+    // The note is a separate control from the pointer: one button that reads the current state and offers the opposite.
+    const armed = noteArmed(route)
+    row.appendChild(button(armed ? '✕ Skip this note' : '↻ Send scene note', () => send({ type: 'set_note', chatId: state!.chatId!, armed: !armed, messageCount: messageCount(), latestMessageId: latestMessageId() }), {
+      disabled: !route.enabled || route.stageIndex <= 0,
+      title: route.stageIndex <= 0 ? 'Stage 1 never gets a note: the chat opened with it' : armed ? 'Move on without the scene-change note for this stage' : 'Send this stage\'s scene-change note on the next reply',
+    }))
+    if (!route.enabled) box.appendChild(el('div', 'sc-hint', 'Stagecoach is off for this chat. Tick "Enabled for this chat" at the top to move between stages.'))
     box.appendChild(row)
     box.appendChild(el('div', 'sc-hint', route.stageIndex >= route.route.length - 1
       ? 'This is the last stage in the route. Add another greeting below if the story should go further.'
-      : 'Advance when the current scene feels finished. The next reply, and only that one, gets a scene-change note using the "Way in" chosen for the new stage. Stage 1 never gets a note: the chat opened with it.'))
+      : 'Advance when the current scene feels finished: the next reply, and only that one, gets a scene-change note using the "Way in" chosen for the new stage. Back moves without sending anything. The note button skips a note you do not want, or sends the current stage\'s note again. Stage 1 never gets a note: the chat opened with it.'))
     root.appendChild(box)
   }
 
@@ -439,6 +465,9 @@ export function setup(ctx: SpindleFrontendContext) {
           ? `Opening greeting not detected: the first message reads "${state!.openingSample}" and no greeting on this card matches it.`
           : `Opening greeting not detected (${state!.openingStatus}).`))
     }
+    if (state!.isGroup && state!.members) {
+      box.appendChild(el('div', 'sc-hint', `Group chat: ${state!.members.map((m) => m.name).join(', ')}. Greetings from every member are listed; the badge shows whose card each is, and {{char}} on that card means them.`))
+    }
     const opening = state!.openingHash ? state!.greetings.find((g) => g.hash === state!.openingHash) ?? null : null
     if (opening && hashes[0] !== opening.hash) {
       const n = el('div', 'sc-notice')
@@ -452,6 +481,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const item = el('div', `sc-item${route && i === route.stageIndex ? ' sc-current' : ''}`)
       const headRow = el('div', 'sc-item-head')
       headRow.appendChild(el('span', 'sc-item-title', `${i + 1}. ${g ? greetingTitle(g) : 'unknown greeting'}`))
+      if (state!.isGroup && g?.characterName) headRow.appendChild(el('span', 'sc-badge', g.characterName))
       if (g && g.hash === state!.openingHash) headRow.appendChild(el('span', 'sc-badge', 'chat opened here'))
       headRow.appendChild(el('span', `sc-badge${g?.card ? ' sc-ok' : ''}`, g?.card ? 'card ready' : 'no card'))
       headRow.appendChild(button('▲', () => { const n = [...hashes]; [n[i - 1], n[i]] = [n[i]!, n[i - 1]!]; commit(n) }, { icon: true, disabled: i === 0, title: 'Move up' }))
@@ -491,6 +521,7 @@ export function setup(ctx: SpindleFrontendContext) {
         const item = el('div', 'sc-item')
         const headRow = el('div', 'sc-item-head')
         headRow.appendChild(el('span', 'sc-item-title', greetingTitle(g)))
+        if (state!.isGroup && g.characterName) headRow.appendChild(el('span', 'sc-badge', g.characterName))
         if (g.hash === state!.openingHash) headRow.appendChild(el('span', 'sc-badge', 'chat opened here'))
         headRow.appendChild(el('span', `sc-badge${g.card ? ' sc-ok' : ''}`, g.card ? 'card ready' : 'no card'))
         headRow.appendChild(button('+ Add', () => commit([...hashes, g.hash]), { primary: true }))
@@ -511,7 +542,7 @@ export function setup(ctx: SpindleFrontendContext) {
     editingNew = !card
     editing = card
       ? { ...card, dirtySinceDistill: false }
-      : { hash, label: g ? greetingTitle(g) : '', presupposes: '', scene: '', mood: '', doneWhen: '', source: 'manual', dirtySinceDistill: false }
+      : { hash, label: g ? greetingTitle(g) : '', presupposes: '', scene: '', mood: '', doneWhen: '', with: '', source: 'manual', dirtySinceDistill: false }
     notice = null
     render()
     root.querySelector('.sc-editor')?.scrollIntoView({ block: 'nearest' })
@@ -520,7 +551,8 @@ export function setup(ctx: SpindleFrontendContext) {
   function renderEditor(): void {
     const draft = editing!
     const g = state!.greetings.find((x) => x.hash === draft.hash) ?? null
-    const { box, head } = section(`Stage card · ${g ? greetingTitle(g) : draft.hash.slice(0, 8)}`)
+    const owner = state!.isGroup && g?.characterName ? ` · ${g.characterName}` : ''
+    const { box, head } = section(`Stage card · ${g ? greetingTitle(g) : draft.hash.slice(0, 8)}${owner}`)
     box.classList.add('sc-editor')
     head.appendChild(el('span', 'sc-muted', draft.source === 'llm' ? 'distilled' : draft.source))
 
@@ -531,9 +563,11 @@ export function setup(ctx: SpindleFrontendContext) {
       box.appendChild(src)
     }
 
-    const fields: Array<{ key: 'label' | 'scene' | 'mood'; label: string; hint: string; single?: boolean }> = [
+    const fields: Array<{ key: 'label' | 'scene' | 'with' | 'mood'; label: string; hint: string; single?: boolean }> = [
       { key: 'label', label: 'Label', hint: 'Short name for this stage, e.g. "Riding lesson".', single: true },
       { key: 'scene', label: 'Scene', hint: 'Setting and situation. No dialogue, no {{user}} actions. This goes to the model.' },
+      // Group chats only: solo chats ignore the field entirely, so it is not shown there.
+      ...(state!.isGroup ? [{ key: 'with' as const, label: 'Scene is with', hint: 'Who this card\'s character shares the scene with. Blank means {{user}}. Name another character and {{user}} in the scene and mood above becomes them. Ignored in solo chats. This goes to the model.', single: true }] : []),
       { key: 'mood', label: 'Mood', hint: 'Tone, plus an intimacy ceiling for the transition message. This goes to the model.' },
     ]
     let contextBox: HTMLElement | null = null
@@ -558,7 +592,21 @@ export function setup(ctx: SpindleFrontendContext) {
       wrap.appendChild(lbl)
       const input = f.single ? el('input') : el('textarea')
       if (input instanceof HTMLInputElement) input.type = 'text'
-      input.value = draft[f.key]
+      if (f.key === 'with' && input instanceof HTMLInputElement && state!.isGroup && state!.members) {
+        // Other members as quick picks; free text still allowed.
+        const list = el('datalist')
+        list.id = 'sc-partner-names'
+        for (const m of state!.members) {
+          if (m.id === g?.characterId) continue
+          const opt = el('option')
+          opt.value = m.name
+          list.appendChild(opt)
+        }
+        input.setAttribute('list', list.id)
+        input.placeholder = '{{user}}'
+        wrap.appendChild(list)
+      }
+      input.value = draft[f.key] ?? ''
       input.addEventListener('input', () => {
         draft[f.key] = input.value
         if (draft.source === 'llm') { draft.source = 'edited' }
@@ -581,7 +629,10 @@ export function setup(ctx: SpindleFrontendContext) {
     box.appendChild(previewTitle)
     const currentInstructions = () => instructionsDraft ?? state!.settings.inStageInstructions ?? DEFAULT_IN_STAGE_INSTRUCTIONS
     const updatePreview = () => {
-      const r = renderDirective('in-stage', { ...draft, updatedAt: 0 }, LITERAL_NAMES, { instructions: currentInstructions() })
+      const r = renderDirective('in-stage', { ...draft, updatedAt: 0 }, LITERAL_NAMES, {
+        instructions: currentInstructions(),
+        group: state!.isGroup === true,
+      })
       const shown = (state!.route?.injectMode ?? 'append-to-last-user') === 'append-to-last-user' ? wrapForAppend(r.text) : r.text
       previewBox.textContent = shown + (r.truncated ? '\n\n(truncated to fit the cap: shorten scene, mood or the instructions)' : '')
     }
@@ -723,9 +774,10 @@ export function setup(ctx: SpindleFrontendContext) {
     box.appendChild(el('div', 'sc-hint', 'Append mode merges the directive into your latest turn, which steered reliably in testing; it has no separate Prompt Breakdown entry. System mode shows up as its own block but some models ignore it.'))
 
 
-    if (route && route.injectMode === 'system-at-depth') {
+    if (route) {
+      const systemMode = route.injectMode === 'system-at-depth'
       const drow = el('div', 'sc-row')
-      drow.appendChild(el('span', undefined, 'Depth'))
+      drow.appendChild(el('span', undefined, systemMode ? 'Depth' : 'Fallback depth'))
       const depthInput = el('input')
       depthInput.type = 'number'
       depthInput.min = '0'
@@ -737,7 +789,9 @@ export function setup(ctx: SpindleFrontendContext) {
       drow.appendChild(depthInput)
       drow.appendChild(el('span', 'sc-muted', 'history messages between the directive and the end of the chat'))
       box.appendChild(drow)
-      box.appendChild(el('div', 'sc-hint', '0 places it right after the latest message (strongest steer). Higher numbers push it further back and steer more gently.'))
+      box.appendChild(el('div', 'sc-hint', systemMode
+        ? '0 places it right after the latest message (strongest steer). Higher numbers push it further back and steer more gently.'
+        : 'Used only when the latest message is not yours, as when a group member speaks without a fresh turn from you: the note then goes in as a system message at this depth instead of being appended. 0 = right after the latest message.'))
     }
     root.appendChild(box)
   }

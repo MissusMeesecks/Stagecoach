@@ -14,8 +14,7 @@ var MAX_REMINDER_EVERY = 10;
 function reminderDue(input) {
   if (input.stageIndex <= 0)
     return false;
-  const turns = turnsInStage(input.currentIndex, input.enteredAt ?? 0);
-  const since = turns - ARRIVAL_TURNS;
+  const since = input.replies - ARRIVAL_TURNS;
   if (since < 0)
     return true;
   const every = Math.floor(input.every);
@@ -24,12 +23,12 @@ function reminderDue(input) {
   return since % every === 0;
 }
 function chooseTier(input) {
-  const { stageIndex, enteredAt, currentIndex } = input;
+  const { stageIndex, enteredAt, replies } = input;
   if (stageIndex <= 0)
     return "in-stage";
   if (enteredAt === undefined)
     return "in-stage";
-  return turnsInStage(currentIndex, enteredAt) < ARRIVAL_TURNS ? "arrival" : "in-stage";
+  return replies < ARRIVAL_TURNS ? "arrival" : "in-stage";
 }
 
 // src/core/templates.ts
@@ -76,16 +75,24 @@ function effectiveInstructions(custom) {
   const t = custom ? clean(custom) : "";
   return t.length > 0 ? t : DEFAULT_IN_STAGE_INSTRUCTIONS;
 }
-function frame(tier, style, scene, mood, instructions) {
-  return tier === "arrival" ? `${arrivalFrame(style, scene, mood)} ${TENSE_NOTE}` : `${scene} Mood: ${mood} ${instructions}`;
+function partnerLine(char, partner) {
+  return partner ? ` This scene is between ${char} and ${partner}.` : "";
+}
+function frame(tier, style, scene, mood, instructions, partner) {
+  const where = `${scene}${partner}`;
+  return tier === "arrival" ? `${arrivalFrame(style, where, mood)} ${TENSE_NOTE}` : `${where} Mood: ${mood} ${instructions}`;
 }
 function renderDirective(tier, card, names, options = {}) {
   const style = effectiveTransition(options.transition);
   const capChars = (options.tokenCap ?? DIRECTIVE_TOKEN_CAP) * 4;
-  let scene = clean(substituteNames(card.scene, names));
-  let mood = clean(substituteNames(card.mood, names));
+  const withField = options.group ? clean(card.with ?? "") || "{{user}}" : "";
+  const partnerName = clean(substituteNames(withField, names));
+  const cardNames = options.group && partnerName && partnerName !== names.user ? { ...names, user: partnerName } : names;
+  let scene = clean(substituteNames(card.scene, cardNames));
+  let mood = clean(substituteNames(card.mood, cardNames));
   const instructions = effectiveInstructions(options.instructions);
-  let body = frame(tier, style, scene, mood, instructions);
+  const partner = partnerLine(names.char, partnerName);
+  let body = frame(tier, style, scene, mood, instructions, partner);
   let truncated = false;
   if (body.length > capChars) {
     const frameLen = body.length - scene.length - mood.length;
@@ -95,7 +102,7 @@ function renderDirective(tier, card, names, options = {}) {
     if (scene.length + mood.length > budget)
       scene = truncateToChars(scene, Math.max(24, budget - mood.length));
     truncated = true;
-    body = frame(tier, style, scene, mood, instructions);
+    body = frame(tier, style, scene, mood, instructions, partner);
     if (body.length > capChars)
       body = truncateToChars(body, capChars);
   }
@@ -187,7 +194,7 @@ function preview(text, max = 140) {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 function cardTokens(c) {
-  return [c.scene, c.mood].join(" ");
+  return [c.scene, c.mood, c.with ?? ""].join(" ");
 }
 function setup(ctx) {
   const cleanups = [];
@@ -230,6 +237,20 @@ function setup(ctx) {
       return ctx.messages.listMessageIds().length;
     } catch {
       return 0;
+    }
+  }
+  function noteArmed(route) {
+    if (route.stageIndex <= 0 || route.skipNote)
+      return false;
+    const entered = route.enteredAt[route.stageIndex];
+    const turns = entered === undefined ? 0 : turnsInStage(messageCount(), entered);
+    return reminderDue({ stageIndex: route.stageIndex, replies: turns, every: reminderEveryFor(route) });
+  }
+  function latestMessageId() {
+    try {
+      return ctx.messages.getLatestMessageId();
+    } catch {
+      return null;
     }
   }
   async function openingText() {
@@ -461,7 +482,8 @@ function setup(ctx) {
     tab.setBadge(enabled && route && route.route.length > 0 ? `${route.stageIndex + 1}/${route.route.length}` : null);
   }
   function renderHeader(enabled) {
-    const { box } = section(state.characterName ? `Stagecoach · ${state.characterName}` : "Stagecoach");
+    const title = state.isGroup && state.members ? `Stagecoach · group: ${state.members.map((m) => m.name).join(", ")}` : state.characterName ? `Stagecoach · ${state.characterName}` : "Stagecoach";
+    const { box } = section(title);
     const row = el("div", "sc-row");
     const toggle = el("label", "sc-toggle");
     const cb = el("input");
@@ -483,12 +505,12 @@ function setup(ctx) {
       const current = stages[route.stageIndex];
       const count = messageCount();
       const entered = route.enteredAt[route.stageIndex];
-      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt: entered, currentIndex: count });
       const turns = entered === undefined ? 0 : turnsInStage(count, entered);
-      const due = reminderDue({ stageIndex: route.stageIndex, enteredAt: entered, currentIndex: count, every: reminderEveryFor(route) });
+      const tier = chooseTier({ stageIndex: route.stageIndex, stageCount: route.route.length, enteredAt: entered, replies: turns });
+      const due = !route.skipNote && reminderDue({ stageIndex: route.stageIndex, replies: turns, every: reminderEveryFor(route) });
       const noteLabel = due ? tier === "arrival" ? "scene-change note" : "in-stage note" : "no note";
       const isFinal = route.stageIndex >= route.route.length - 1;
-      const noteDetail = route.stageIndex === 0 ? isFinal ? " (stage 1 is where the chat opened; add more stages to steer)" : " (stage 1 is where the chat opened; nothing to steer yet)" : due ? "" : isFinal ? ` (final stage; the story is on its own from here)` : ` (turn ${turns} in this stage; press Advance when the scene feels finished)`;
+      const noteDetail = route.stageIndex === 0 ? isFinal ? " (stage 1 is where the chat opened; add more stages to steer)" : " (stage 1 is where the chat opened; nothing to steer yet)" : due ? "" : route.skipNote ? " (skipped for this stage)" : isFinal ? ` (final stage; the story is on its own from here)` : ` (turn ${turns} in this stage; press Advance when the scene feels finished)`;
       const missingCard = current && !current.card;
       status.innerHTML = "";
       status.append(document.createTextNode("Stage "), Object.assign(el("strong"), { textContent: `${route.stageIndex + 1}/${route.route.length}` }), document.createTextNode(` · ${current ? greetingTitle(current) : "unknown greeting"} · next reply: `), Object.assign(el("strong"), { textContent: noteLabel }), document.createTextNode(noteDetail));
@@ -512,12 +534,20 @@ function setup(ctx) {
         opt.selected = true;
       sel.appendChild(opt);
     });
-    sel.addEventListener("change", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: Number(sel.value), messageCount: messageCount() }));
+    sel.addEventListener("change", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: Number(sel.value), messageCount: messageCount(), latestMessageId: latestMessageId() }));
     row.appendChild(sel);
-    row.appendChild(button("◀ Back", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: route.stageIndex - 1, messageCount: messageCount() }), { disabled: route.stageIndex <= 0 }));
-    row.appendChild(button("Advance ▶", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: route.stageIndex + 1, messageCount: messageCount() }), { primary: true, disabled: route.stageIndex >= route.route.length - 1 }));
+    sel.disabled = !route.enabled;
+    row.appendChild(button("◀ Back", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: route.stageIndex - 1, messageCount: messageCount(), latestMessageId: latestMessageId() }), { disabled: !route.enabled || route.stageIndex <= 0, title: route.enabled ? undefined : "Enable Stagecoach for this chat first" }));
+    row.appendChild(button("Advance ▶", () => send({ type: "set_stage", chatId: state.chatId, stageIndex: route.stageIndex + 1, messageCount: messageCount(), latestMessageId: latestMessageId() }), { primary: true, disabled: !route.enabled || route.stageIndex >= route.route.length - 1, title: route.enabled ? undefined : "Enable Stagecoach for this chat first" }));
+    const armed = noteArmed(route);
+    row.appendChild(button(armed ? "✕ Skip this note" : "↻ Send scene note", () => send({ type: "set_note", chatId: state.chatId, armed: !armed, messageCount: messageCount(), latestMessageId: latestMessageId() }), {
+      disabled: !route.enabled || route.stageIndex <= 0,
+      title: route.stageIndex <= 0 ? "Stage 1 never gets a note: the chat opened with it" : armed ? "Move on without the scene-change note for this stage" : "Send this stage's scene-change note on the next reply"
+    }));
+    if (!route.enabled)
+      box.appendChild(el("div", "sc-hint", 'Stagecoach is off for this chat. Tick "Enabled for this chat" at the top to move between stages.'));
     box.appendChild(row);
-    box.appendChild(el("div", "sc-hint", route.stageIndex >= route.route.length - 1 ? "This is the last stage in the route. Add another greeting below if the story should go further." : 'Advance when the current scene feels finished. The next reply, and only that one, gets a scene-change note using the "Way in" chosen for the new stage. Stage 1 never gets a note: the chat opened with it.'));
+    box.appendChild(el("div", "sc-hint", route.stageIndex >= route.route.length - 1 ? "This is the last stage in the route. Add another greeting below if the story should go further." : `Advance when the current scene feels finished: the next reply, and only that one, gets a scene-change note using the "Way in" chosen for the new stage. Back moves without sending anything. The note button skips a note you do not want, or sends the current stage's note again. Stage 1 never gets a note: the chat opened with it.`));
     root.appendChild(box);
   }
   function renderRoute(route, stages) {
@@ -528,6 +558,9 @@ function setup(ctx) {
     const commit = (next) => send({ type: "set_route", chatId: state.chatId, route: next, messageCount: messageCount() });
     if (state.openingStatus && state.openingStatus !== "matched") {
       box.appendChild(el("div", "sc-hint", state.openingStatus === "first-message-not-on-screen" ? "Opening greeting not detected: scroll the chat to its first message and refresh (⟳)." : state.openingStatus === "no-match" && state.openingSample ? `Opening greeting not detected: the first message reads "${state.openingSample}" and no greeting on this card matches it.` : `Opening greeting not detected (${state.openingStatus}).`));
+    }
+    if (state.isGroup && state.members) {
+      box.appendChild(el("div", "sc-hint", `Group chat: ${state.members.map((m) => m.name).join(", ")}. Greetings from every member are listed; the badge shows whose card each is, and {{char}} on that card means them.`));
     }
     const opening = state.openingHash ? state.greetings.find((g) => g.hash === state.openingHash) ?? null : null;
     if (opening && hashes[0] !== opening.hash) {
@@ -542,6 +575,8 @@ function setup(ctx) {
       const item = el("div", `sc-item${route && i === route.stageIndex ? " sc-current" : ""}`);
       const headRow = el("div", "sc-item-head");
       headRow.appendChild(el("span", "sc-item-title", `${i + 1}. ${g ? greetingTitle(g) : "unknown greeting"}`));
+      if (state.isGroup && g?.characterName)
+        headRow.appendChild(el("span", "sc-badge", g.characterName));
       if (g && g.hash === state.openingHash)
         headRow.appendChild(el("span", "sc-badge", "chat opened here"));
       headRow.appendChild(el("span", `sc-badge${g?.card ? " sc-ok" : ""}`, g?.card ? "card ready" : "no card"));
@@ -591,6 +626,8 @@ function setup(ctx) {
         const item = el("div", "sc-item");
         const headRow = el("div", "sc-item-head");
         headRow.appendChild(el("span", "sc-item-title", greetingTitle(g)));
+        if (state.isGroup && g.characterName)
+          headRow.appendChild(el("span", "sc-badge", g.characterName));
         if (g.hash === state.openingHash)
           headRow.appendChild(el("span", "sc-badge", "chat opened here"));
         headRow.appendChild(el("span", `sc-badge${g.card ? " sc-ok" : ""}`, g.card ? "card ready" : "no card"));
@@ -609,7 +646,7 @@ function setup(ctx) {
   function openEditor(g, hash) {
     const card = g?.card ?? null;
     editingNew = !card;
-    editing = card ? { ...card, dirtySinceDistill: false } : { hash, label: g ? greetingTitle(g) : "", presupposes: "", scene: "", mood: "", doneWhen: "", source: "manual", dirtySinceDistill: false };
+    editing = card ? { ...card, dirtySinceDistill: false } : { hash, label: g ? greetingTitle(g) : "", presupposes: "", scene: "", mood: "", doneWhen: "", with: "", source: "manual", dirtySinceDistill: false };
     notice = null;
     render();
     root.querySelector(".sc-editor")?.scrollIntoView({ block: "nearest" });
@@ -617,7 +654,8 @@ function setup(ctx) {
   function renderEditor() {
     const draft = editing;
     const g = state.greetings.find((x) => x.hash === draft.hash) ?? null;
-    const { box, head } = section(`Stage card · ${g ? greetingTitle(g) : draft.hash.slice(0, 8)}`);
+    const owner = state.isGroup && g?.characterName ? ` · ${g.characterName}` : "";
+    const { box, head } = section(`Stage card · ${g ? greetingTitle(g) : draft.hash.slice(0, 8)}${owner}`);
     box.classList.add("sc-editor");
     head.appendChild(el("span", "sc-muted", draft.source === "llm" ? "distilled" : draft.source));
     if (g?.text) {
@@ -629,6 +667,7 @@ function setup(ctx) {
     const fields = [
       { key: "label", label: "Label", hint: 'Short name for this stage, e.g. "Riding lesson".', single: true },
       { key: "scene", label: "Scene", hint: "Setting and situation. No dialogue, no {{user}} actions. This goes to the model." },
+      ...state.isGroup ? [{ key: "with", label: "Scene is with", hint: "Who this card's character shares the scene with. Blank means {{user}}. Name another character and {{user}} in the scene and mood above becomes them. Ignored in solo chats. This goes to the model.", single: true }] : [],
       { key: "mood", label: "Mood", hint: "Tone, plus an intimacy ceiling for the transition message. This goes to the model." }
     ];
     let contextBox = null;
@@ -655,7 +694,21 @@ function setup(ctx) {
       const input = f.single ? el("input") : el("textarea");
       if (input instanceof HTMLInputElement)
         input.type = "text";
-      input.value = draft[f.key];
+      if (f.key === "with" && input instanceof HTMLInputElement && state.isGroup && state.members) {
+        const list = el("datalist");
+        list.id = "sc-partner-names";
+        for (const m of state.members) {
+          if (m.id === g?.characterId)
+            continue;
+          const opt = el("option");
+          opt.value = m.name;
+          list.appendChild(opt);
+        }
+        input.setAttribute("list", list.id);
+        input.placeholder = "{{user}}";
+        wrap.appendChild(list);
+      }
+      input.value = draft[f.key] ?? "";
       input.addEventListener("input", () => {
         draft[f.key] = input.value;
         if (draft.source === "llm") {
@@ -678,7 +731,10 @@ function setup(ctx) {
     box.appendChild(previewTitle);
     const currentInstructions = () => instructionsDraft ?? state.settings.inStageInstructions ?? DEFAULT_IN_STAGE_INSTRUCTIONS;
     const updatePreview = () => {
-      const r = renderDirective("in-stage", { ...draft, updatedAt: 0 }, LITERAL_NAMES, { instructions: currentInstructions() });
+      const r = renderDirective("in-stage", { ...draft, updatedAt: 0 }, LITERAL_NAMES, {
+        instructions: currentInstructions(),
+        group: state.isGroup === true
+      });
       const shown = (state.route?.injectMode ?? "append-to-last-user") === "append-to-last-user" ? wrapForAppend(r.text) : r.text;
       previewBox.textContent = shown + (r.truncated ? `
 
@@ -835,9 +891,10 @@ function setup(ctx) {
     row.appendChild(sel);
     box.appendChild(row);
     box.appendChild(el("div", "sc-hint", "Append mode merges the directive into your latest turn, which steered reliably in testing; it has no separate Prompt Breakdown entry. System mode shows up as its own block but some models ignore it."));
-    if (route && route.injectMode === "system-at-depth") {
+    if (route) {
+      const systemMode = route.injectMode === "system-at-depth";
       const drow = el("div", "sc-row");
-      drow.appendChild(el("span", undefined, "Depth"));
+      drow.appendChild(el("span", undefined, systemMode ? "Depth" : "Fallback depth"));
       const depthInput = el("input");
       depthInput.type = "number";
       depthInput.min = "0";
@@ -849,7 +906,7 @@ function setup(ctx) {
       drow.appendChild(depthInput);
       drow.appendChild(el("span", "sc-muted", "history messages between the directive and the end of the chat"));
       box.appendChild(drow);
-      box.appendChild(el("div", "sc-hint", "0 places it right after the latest message (strongest steer). Higher numbers push it further back and steer more gently."));
+      box.appendChild(el("div", "sc-hint", systemMode ? "0 places it right after the latest message (strongest steer). Higher numbers push it further back and steer more gently." : "Used only when the latest message is not yours, as when a group member speaks without a fresh turn from you: the note then goes in as a system message at this depth instead of being appended. 0 = right after the latest message."));
     }
     root.appendChild(box);
   }
