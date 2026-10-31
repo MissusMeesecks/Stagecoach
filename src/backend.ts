@@ -26,14 +26,16 @@ import type {
   PanelState,
   StageCard,
 } from './shared/types.ts'
-import { DEFAULT_SETTINGS, INSTRUCTIONS_MAX_CHARS } from './shared/types.ts'
+import { DEFAULT_SETTINGS, tokenLimitsFor } from './shared/types.ts'
 import { hashGreeting, isValidHash } from './core/hash.ts'
 import { chooseTier, repliesSince, reminderDue } from './core/tiers.ts'
-import { breakdownName, renderDirective, estimateTokens, DEFAULT_IN_STAGE_INSTRUCTIONS, type Names } from './core/templates.ts'
+import { breakdownName, renderDirective, estimateTokens, type Names } from './core/templates.ts'
+import { applySettingsPatch, normalizeSettings } from './core/settings.ts'
+import { noteOptions } from './core/preview.ts'
 import { matchGreeting, sample } from './core/opening.ts'
 import { groupInfo } from './core/group.ts'
 import { injectDirective } from './core/inject.ts'
-import { applyRoute, depthFor, forkRoute, isTransitionStyle, newRoute, normalizeRoute, reminderEveryFor, rewindTo, setDepth, setReminderEvery, setStage, setTransition, transitionFor, anchorFor, replayStage, skipNote } from './core/route.ts'
+import { applyRoute, depthFor, forkRoute, isTransitionStyle, newRoute, normalizeRoute, reminderEveryFor, rewindTo, setDepth, setReminderEvery, setStage, setTransition, anchorFor, replayStage, skipNote } from './core/route.ts'
 
 declare const spindle: SpindleAPI
 
@@ -42,19 +44,63 @@ const INTERCEPTOR_PRIORITY = 400
 
 // ---------------------------------------------------------------------------
 // Caches. The interceptor reads only these; UI handlers and events write them.
+//
+// One worker can serve several users (operator installs), and everything
+// stored lives in per-user storage, so every cache is per user too. Cards are
+// content-addressed: two users with the same public card share greeting
+// hashes, and a shared cache would hand one user's stage cards to the other.
 // ---------------------------------------------------------------------------
-const routeCache = new Map<string, ChatRoute | null>()
-const cardCache = new Map<string, StageCard | null>()
-const namesCache = new Map<string, Names>()
-const characterCache = new Map<string, CharacterDTO | null>()
-const chatCache = new Map<string, ChatDTO | null>()
+interface UserCaches {
+  routes: Map<string, ChatRoute | null>
+  cards: Map<string, StageCard | null>
+  names: Map<string, Names>
+  characters: Map<string, CharacterDTO | null>
+  chats: Map<string, ChatDTO | null>
+  /** Per chat. Cleared with the characters and when the chat record changes (membership lives in chat metadata). */
+  greetings: Map<string, PooledGreetings>
+  /** Greeting text with macros resolved for a chat, keyed by `${chatId}:${hash}`. Used to match the chat's opening message. */
+  resolvedGreetings: Map<string, string>
+  /** Last opening-message probe the frontend sent for a chat, reused by state refreshes that do not re-probe. */
+  openings: Map<string, { text: string | null; probe: string; candidates: string[] }>
+  settings: ExtensionSettings | null
+}
+
+const userCaches = new Map<string, UserCaches>()
+
+function cachesFor(userId: string | undefined): UserCaches {
+  const key = userId ?? ''
+  let c = userCaches.get(key)
+  if (!c) {
+    c = { routes: new Map(), cards: new Map(), names: new Map(), characters: new Map(), chats: new Map(), greetings: new Map(), resolvedGreetings: new Map(), openings: new Map(), settings: null }
+    userCaches.set(key, c)
+  }
+  return c
+}
+
+/** Invalidation from host events, which may not say whose data changed: clearing too much only costs a re-read. */
+function eachUser(fn: (c: UserCaches) => void): void {
+  for (const c of userCaches.values()) fn(c)
+}
+
+/** Host-supplied user ids seen since the worker started (frontend messages and events). */
+const knownUsers = new Set<string>()
+
+/**
+ * The user a call acts for. A host-supplied id always wins. Events may omit
+ * it: then the call falls back to the only user seen since the worker
+ * started. That is right on a single-user install, and keeps it on one set of
+ * caches; on an operator install it can be another user who has not been
+ * seen yet, so anything acting on a fallback must stay harmless if the guess
+ * is wrong. Once several users have been seen there is no fallback at all.
+ * `record: false` resolves without remembering the id (the interceptor stays
+ * free of side effects).
+ */
+function actingUser(id: string | null | undefined, record = true): string | undefined {
+  if (id) { if (record) knownUsers.add(id); return id }
+  return knownUsers.size === 1 ? knownUsers.values().next().value : undefined
+}
+
 const fallbackIndexLogged = new Set<string>()
-/** Greeting text with macros resolved for a chat, keyed by `${chatId}:${hash}`. Used to match the chat's opening message. */
-const resolvedGreetingCache = new Map<string, string>()
-/** Last opening-message probe the frontend sent for a chat, reused by state refreshes that do not re-probe. */
-const lastOpening = new Map<string, { text: string | null; probe: string; candidates: string[] }>()
-let settingsCache: ExtensionSettings | null = null
-let currentUserId: string | undefined
 
 function has(permission: string): boolean {
   try { return spindle.permissions.has(permission) } catch { return false }
@@ -71,7 +117,8 @@ function routePath(chatId: string): string { return `chats/${encodeURIComponent(
 function cardPath(hash: string): string { return `cards/${hash}.json` }
 
 async function loadRoute(chatId: string, userId?: string): Promise<ChatRoute | null> {
-  if (routeCache.has(chatId)) return routeCache.get(chatId) ?? null
+  const cache = cachesFor(userId).routes
+  if (cache.has(chatId)) return cache.get(chatId) ?? null
   let route: ChatRoute | null = null
   try {
     const raw = await spindle.userStorage.getJson<unknown>(routePath(chatId), { fallback: null, userId })
@@ -84,18 +131,21 @@ async function loadRoute(chatId: string, userId?: string): Promise<ChatRoute | n
   } catch (err) {
     spindle.log.warn(`${LOG} could not read route for chat ${chatId}: ${errMsg(err)}`)
   }
-  routeCache.set(chatId, route)
+  // A save that landed while this read was in flight is newer than what was read.
+  if (cache.has(chatId)) return cache.get(chatId) ?? null
+  cache.set(chatId, route)
   return route
 }
 
 async function saveRoute(route: ChatRoute, userId?: string): Promise<void> {
   await spindle.userStorage.setJson(routePath(route.chatId), route, { indent: 2, userId })
-  routeCache.set(route.chatId, route)
+  cachesFor(userId).routes.set(route.chatId, route)
 }
 
 async function loadCard(hash: string, userId?: string): Promise<StageCard | null> {
   if (!isValidHash(hash)) return null
-  if (cardCache.has(hash)) return cardCache.get(hash) ?? null
+  const cache = cachesFor(userId).cards
+  if (cache.has(hash)) return cache.get(hash) ?? null
   let card: StageCard | null = null
   try {
     const raw = await spindle.userStorage.getJson<unknown>(cardPath(hash), { fallback: null, userId })
@@ -103,40 +153,38 @@ async function loadCard(hash: string, userId?: string): Promise<StageCard | null
   } catch (err) {
     spindle.log.warn(`${LOG} could not read card ${hash.slice(0, 8)}: ${errMsg(err)}`)
   }
-  cardCache.set(hash, card)
+  if (cache.has(hash)) return cache.get(hash) ?? null
+  cache.set(hash, card)
   return card
 }
 
 async function saveCard(card: StageCard, userId?: string): Promise<void> {
   await spindle.userStorage.setJson(cardPath(card.hash), card, { indent: 2, userId })
-  cardCache.set(card.hash, card)
+  cachesFor(userId).cards.set(card.hash, card)
 }
 
 async function deleteCard(hash: string, userId?: string): Promise<void> {
   if (!isValidHash(hash)) return
   try { await spindle.userStorage.delete(cardPath(hash), userId) } catch { /* already gone */ }
-  cardCache.set(hash, null)
+  cachesFor(userId).cards.set(hash, null)
 }
 
 async function loadSettings(userId?: string): Promise<ExtensionSettings> {
-  if (settingsCache) return settingsCache
+  const cache = cachesFor(userId)
+  if (cache.settings) return cache.settings
+  let settings: ExtensionSettings
   try {
-    const raw = await spindle.userStorage.getJson<Partial<ExtensionSettings>>('settings.json', { fallback: {}, userId })
-    settingsCache = { ...DEFAULT_SETTINGS, ...(raw ?? {}) }
+    settings = normalizeSettings(await spindle.userStorage.getJson<unknown>('settings.json', { fallback: {}, userId }))
   } catch {
-    settingsCache = { ...DEFAULT_SETTINGS }
+    settings = { ...DEFAULT_SETTINGS }
   }
-  return settingsCache
-}
-
-/** Blank or default text stores as null (= use the built-in default); anything else is trimmed and length-capped. */
-function normaliseInstructions(text: string): string | null {
-  const t = text.replace(/\s+/g, ' ').trim().slice(0, INSTRUCTIONS_MAX_CHARS)
-  return t.length === 0 || t === DEFAULT_IN_STAGE_INSTRUCTIONS ? null : t
+  // Settings saved while this read was in flight win.
+  cache.settings ??= settings
+  return cache.settings
 }
 
 async function saveSettings(settings: ExtensionSettings, userId?: string): Promise<void> {
-  settingsCache = settings
+  cachesFor(userId).settings = settings
   await spindle.userStorage.setJson('settings.json', settings, { indent: 2, userId })
 }
 
@@ -166,24 +214,26 @@ function sanitizeCard(raw: unknown, hash: string): StageCard | null {
 // Chat / character lookups (permissions: chats, characters)
 // ---------------------------------------------------------------------------
 async function getChat(chatId: string, userId?: string): Promise<ChatDTO | null> {
-  if (chatCache.has(chatId)) return chatCache.get(chatId) ?? null
+  const cache = cachesFor(userId).chats
+  if (cache.has(chatId)) return cache.get(chatId) ?? null
   if (!has('chats')) return null
   let chat: ChatDTO | null = null
   try { chat = await spindle.chats.get(chatId, userId) } catch (err) {
     spindle.log.warn(`${LOG} chats.get failed: ${errMsg(err)}`)
   }
-  chatCache.set(chatId, chat)
+  cache.set(chatId, chat)
   return chat
 }
 
 async function getCharacter(characterId: string, userId?: string): Promise<CharacterDTO | null> {
-  if (characterCache.has(characterId)) return characterCache.get(characterId) ?? null
+  const cache = cachesFor(userId).characters
+  if (cache.has(characterId)) return cache.get(characterId) ?? null
   if (!has('characters')) return null
   let character: CharacterDTO | null = null
   try { character = await spindle.characters.get(characterId, userId) } catch (err) {
     spindle.log.warn(`${LOG} characters.get failed: ${errMsg(err)}`)
   }
-  characterCache.set(characterId, character)
+  cache.set(characterId, character)
   return character
 }
 
@@ -199,8 +249,6 @@ interface PooledGreetings {
   /** Members in host order, the chat's own character first. Solo chats: one entry. */
   members: Array<{ id: string; name: string }>
 }
-/** Per chat. Cleared with the character cache and when the chat record changes (membership lives in chat metadata). */
-const greetingsCache = new Map<string, PooledGreetings>()
 
 /**
  * Every greeting the panel and the interceptor may use for this chat, with
@@ -209,7 +257,8 @@ const greetingsCache = new Map<string, PooledGreetings>()
  * Returns null only when the chat's own character cannot be loaded.
  */
 async function chatGreetings(chat: ChatDTO, userId?: string): Promise<PooledGreetings | null> {
-  const cached = greetingsCache.get(chat.id)
+  const cache = cachesFor(userId).greetings
+  const cached = cache.get(chat.id)
   if (cached) return cached
   const info = groupInfo(chat.metadata, chat.character_id)
   const greetings: OwnedGreeting[] = []
@@ -231,7 +280,7 @@ async function chatGreetings(chat: ChatDTO, userId?: string): Promise<PooledGree
     }
   }
   const pooled = { greetings, members }
-  greetingsCache.set(chat.id, pooled)
+  cache.set(chat.id, pooled)
   return pooled
 }
 
@@ -280,7 +329,8 @@ async function resolveOne(macro: string, chatId: string, characterId: string | n
  */
 async function resolveNames(chatId: string, characterId: string | null, userId?: string, preferRecord = false): Promise<Names> {
   const cacheKey = `${chatId}:${characterId ?? ''}:${preferRecord ? 'r' : 'm'}`
-  const cached = namesCache.get(cacheKey)
+  const cache = cachesFor(userId).names
+  const cached = cache.get(cacheKey)
   if (cached) return cached
   const [charName, userName] = await Promise.all([
     preferRecord ? Promise.resolve(null) : resolveOne('{{char}}', chatId, characterId, userId),
@@ -289,7 +339,7 @@ async function resolveNames(chatId: string, characterId: string | null, userId?:
   let char = charName
   if (!char && characterId) char = (await getCharacter(characterId, userId))?.name ?? null
   const names: Names = { char: char ?? 'the character', user: userName ?? 'the user' }
-  namesCache.set(cacheKey, names)
+  cache.set(cacheKey, names)
   return names
 }
 
@@ -306,7 +356,7 @@ function tryRegisterInterceptor(): void {
       if (context.generationType === 'impersonate' || context.generationType === 'quiet') return messages
       const chatId = context.chatId
       if (!chatId) return messages
-      const userId = context.userId || currentUserId
+      const userId = actingUser(context.userId, false)
 
       const route = await loadRoute(chatId, userId)
       if (!route || !route.enabled || route.route.length === 0) return messages
@@ -346,11 +396,10 @@ function tryRegisterInterceptor(): void {
       // Group chats take names from the character record: the host's card-macro mode may resolve {{char}} to whoever is active.
       const names = await resolveNames(chatId, owner ?? speaker, userId, isGroup || (owner !== null && owner !== speaker))
       const settings = await loadSettings(userId)
-      const directive = renderDirective(tier, card, names, {
-        transition: transitionFor(route, stageHash),
-        instructions: settings.inStageInstructions,
-        group: isGroup,
-      })
+      // The same options the editor preview renders with (core/preview.ts), so the preview shows what is sent.
+      // The user's own texts (closing line, reminder wording) are global: in a group, {{char}} there is whoever replies.
+      const textNames = isGroup && speaker && speaker !== (owner ?? speaker) ? await resolveNames(chatId, speaker, userId, true) : names
+      const directive = renderDirective(tier, card, names, { ...noteOptions(route, stageHash, settings, isGroup), textNames })
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route))
       spindle.log.info(`${LOG} injected as ${result.appliedMode} (speaker ${speaker ?? '?'}, card owner ${owner ?? '?'})`)
 
@@ -379,14 +428,19 @@ spindle.permissions.onChanged(({ permission, granted }) => {
 // ---------------------------------------------------------------------------
 const onEvent = spindle.on as unknown as (event: string, handler: (payload: unknown, userId?: string) => void) => () => void
 
-onEvent('CHARACTER_EDITED', () => { characterCache.clear(); greetingsCache.clear(); namesCache.clear() })
-onEvent('CHARACTER_DELETED', () => { characterCache.clear(); greetingsCache.clear(); namesCache.clear() })
-onEvent('PERSONA_CHANGED', () => { namesCache.clear(); resolvedGreetingCache.clear() })
+const clearCharacters = () => eachUser((c) => { c.characters.clear(); c.greetings.clear(); c.names.clear() })
+onEvent('CHARACTER_EDITED', clearCharacters)
+onEvent('CHARACTER_DELETED', clearCharacters)
+onEvent('PERSONA_CHANGED', () => eachUser((c) => { c.names.clear(); c.resolvedGreetings.clear() }))
 onEvent('CHAT_FORKED', (payload, eventUserId) => {
   void (async () => {
     const p = payload as { sourceChatId?: unknown; forkedChatId?: unknown; forkedAtMessageIndex?: unknown } | null
     if (!p || typeof p.sourceChatId !== 'string' || typeof p.forkedChatId !== 'string') return
-    const userId = eventUserId || currentUserId
+    const userId = actingUser(eventUserId)
+    if (!userId && knownUsers.size > 1) {
+      spindle.log.warn(`${LOG} CHAT_FORKED arrived without a user id on a multi-user install; route not copied to ${p.forkedChatId}`)
+      return
+    }
     try {
       const source = await loadRoute(p.sourceChatId, userId)
       if (!source) return
@@ -402,7 +456,7 @@ onEvent('CHAT_FORKED', (payload, eventUserId) => {
 })
 onEvent('CHAT_CHANGED', (payload) => {
   const id = (payload as { chat?: { id?: unknown } } | null)?.chat?.id
-  if (typeof id === 'string') { chatCache.delete(id); greetingsCache.delete(id) }
+  if (typeof id === 'string') eachUser((c) => { c.chats.delete(id); c.greetings.delete(id) })
 })
 
 // ---------------------------------------------------------------------------
@@ -422,14 +476,15 @@ async function listConnections(userId?: string): Promise<ConnectionInfo[]> {
 /** Resolve a greeting's macros the way the host did when it opened the chat, so the stored first message can be matched. */
 async function resolvedGreeting(chatId: string, characterId: string, hash: string, text: string, userId?: string): Promise<string> {
   const key = `${chatId}:${hash}`
-  const cached = resolvedGreetingCache.get(key)
+  const cache = cachesFor(userId).resolvedGreetings
+  const cached = cache.get(key)
   if (cached !== undefined) return cached
   let resolved = text
   try {
     resolved = (await spindle.macros.resolve(text, { chatId, characterId, userId, commit: false })).text
   } catch { /* fall back to the raw text */ }
-  if (resolvedGreetingCache.size > 500) resolvedGreetingCache.clear()
-  resolvedGreetingCache.set(key, resolved)
+  if (cache.size > 500) cache.clear()
+  cache.set(key, resolved)
   return resolved
 }
 
@@ -446,9 +501,10 @@ async function matchOpening(chatId: string, characterId: string, greetings: Gree
 
 async function buildPanelState(chatId: string | null, userId?: string, openingText?: string | null, openingProbe?: string, openingCandidates?: string[]): Promise<PanelState> {
   if (chatId) {
-    if (openingProbe !== undefined) lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] })
+    const openings = cachesFor(userId).openings
+    if (openingProbe !== undefined) openings.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] })
     else {
-      const prev = lastOpening.get(chatId)
+      const prev = openings.get(chatId)
       if (prev) { openingText = prev.text; openingProbe = prev.probe; openingCandidates = prev.candidates }
     }
   }
@@ -475,13 +531,15 @@ async function buildPanelState(chatId: string | null, userId?: string, openingTe
     return state
   }
   state.characterId = chat.character_id
+  // From the chat record, as the interceptor reads it, so the preview renders group notes even when a character fails to load.
+  const info = groupInfo(chat.metadata, chat.character_id)
+  if (info.isGroup) state.isGroup = true
   const pooled = await chatGreetings(chat, userId)
   if (!pooled) {
     state.error = has('characters') ? 'Could not load the character for this chat.' : 'The "characters" permission is required to read greetings.'
   } else {
-    const info = groupInfo(chat.metadata, chat.character_id)
     state.characterName = pooled.members[0]?.name ?? null
-    if (info.isGroup) { state.isGroup = true; state.members = pooled.members }
+    if (info.isGroup) state.members = pooled.members
     const greetings: GreetingInfo[] = []
     for (const g of pooled.greetings) greetings.push({ ...g, card: await loadCard(g.hash, userId) })
     state.greetings = greetings
@@ -542,18 +600,21 @@ async function routeForWrite(chatId: string, userId?: string): Promise<ChatRoute
 // Distill — one generate.raw call per greeting, reasoning off, JSON out.
 // Result goes to the editor; nothing is saved until the user clicks Save.
 // ---------------------------------------------------------------------------
-const DISTILL_SYSTEM = [
-  'You turn one greeting from a roleplay character card into a compact "stage card": a description of the story stage that greeting opens.',
-  'Reply with a single JSON object and nothing else, with exactly these string keys:',
-  '- "label": a 2-4 word name for this stage.',
-  '- "presupposes": what must already be true before this scene can open. Describe STATE, not events. At most 25 words.',
-  '- "scene": where and when, and what {{char}} is doing or has arranged. {{user}} may be present, but never describe anything {{user}} does, says, feels, or where {{user}} sits or stands. No dialogue. At most 25 words.',
-  '- "mood": tone, plus an explicit ceiling on intimacy or heat for this stage. At most 25 words.',
-  'Keep the placeholders {{char}} and {{user}} exactly as written; never replace them with names. Write in the present tense. Do not quote the greeting.',
-  '',
-  'Example output for a greeting where the character has invited the user to sit by the fire after weeks of riding together:',
-  '{"label":"Fireside evening","presupposes":"Some weeks have passed. {{user}} has ridden with {{char}} several times and the formality between them has worn off.","scene":"Evening at the ranch house, fire lit, a bottle {{char}} has been saving. {{char}} has cleared the evening for just the two of them.","mood":"Warm, charged, unhurried. Flirtation is mutual; nothing physical has happened yet."}',
-].join('\n')
+/** `words` is the per-field limit, which follows the higher-token-limit setting. */
+function distillSystem(words: number): string {
+  return [
+    'You turn one greeting from a roleplay character card into a compact "stage card": a description of the story stage that greeting opens.',
+    'Reply with a single JSON object and nothing else, with exactly these string keys:',
+    '- "label": a 2-4 word name for this stage.',
+    `- "presupposes": what must already be true before this scene can open. Describe STATE, not events. At most ${words} words.`,
+    `- "scene": where and when, and what {{char}} is doing or has arranged. {{user}} may be present, but never describe anything {{user}} does, says, feels, or where {{user}} sits or stands. No dialogue. At most ${words} words.`,
+    `- "mood": tone, plus an explicit ceiling on intimacy or heat for this stage. At most ${words} words.`,
+    'Keep the placeholders {{char}} and {{user}} exactly as written; never replace them with names. Write in the present tense. Do not quote the greeting.',
+    '',
+    'Example output for a greeting where the character has invited the user to sit by the fire after weeks of riding together:',
+    '{"label":"Fireside evening","presupposes":"Some weeks have passed. {{user}} has ridden with {{char}} several times and the formality between them has worn off.","scene":"Evening at the ranch house, fire lit, a bottle {{char}} has been saving. {{char}} has cleared the evening for just the two of them.","mood":"Warm, charged, unhurried. Flirtation is mutual; nothing physical has happened yet."}',
+  ].join('\n')
+}
 
 function extractContent(result: unknown): string {
   if (typeof result === 'string') return result
@@ -587,7 +648,7 @@ function parseStageJson(text: string): Omit<StageCard, 'hash' | 'updatedAt'> {
   return card
 }
 
-async function distill(chatId: string, hash: string, connectionId: string | null, userId?: string): Promise<void> {
+async function distill(chatId: string, hash: string, connectionId: string | null, runId: string | undefined, userId?: string): Promise<void> {
   if (!has('generation')) throw new Error('The "generation" permission is required for Distill.')
   const chat = await getChat(chatId, userId)
   const pooled = chat ? await chatGreetings(chat, userId) : null
@@ -619,10 +680,11 @@ async function distill(chatId: string, hash: string, connectionId: string | null
   } catch (err) {
     throw new Error(`Could not resolve a connection for Distill: ${errMsg(err)}`)
   }
+  const { distillWords } = tokenLimitsFor(await loadSettings(userId))
   const request: GenerationRequestDTO & { model?: string } = {
     type: 'raw',
     messages: [
-      { role: 'system', content: DISTILL_SYSTEM },
+      { role: 'system', content: distillSystem(distillWords) },
       { role: 'user', content: `Greeting:\n\n${greeting}` },
     ],
     connection_id: resolvedConnectionId,
@@ -636,17 +698,21 @@ async function distill(chatId: string, hash: string, connectionId: string | null
   }
   const result = await spindle.generate.raw(request)
   const card = parseStageJson(extractContent(result))
-  send({ type: 'distill_result', hash, card }, userId)
+  send({ type: 'distill_result', hash, runId, card }, userId)
 }
 
 // ---------------------------------------------------------------------------
 // Frontend messages
 // ---------------------------------------------------------------------------
 spindle.onFrontendMessage(async (payload: unknown, userId: string) => {
-  currentUserId = userId || currentUserId
-  const uid = userId || currentUserId
+  const uid = actingUser(userId)
   const msg = payload as FrontendMessage
   if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return
+  // With several users about, a reply to nobody in particular would be broadcast to all of them.
+  if (!uid && knownUsers.size > 1) {
+    spindle.log.warn(`${LOG} ${msg.type} arrived without a user id on a multi-user install; ignored`)
+    return
+  }
   try {
     switch (msg.type) {
       case 'get_state':
@@ -755,24 +821,14 @@ spindle.onFrontendMessage(async (payload: unknown, userId: string) => {
 
       case 'distill':
         try {
-          await distill(msg.chatId, msg.hash, msg.connectionId ?? null, uid)
+          await distill(msg.chatId, msg.hash, msg.connectionId ?? null, typeof msg.runId === 'string' ? msg.runId : undefined, uid)
         } catch (err) {
-          send({ type: 'distill_error', hash: msg.hash, message: errMsg(err) }, uid)
+          send({ type: 'distill_error', hash: msg.hash, runId: typeof msg.runId === 'string' ? msg.runId : undefined, message: errMsg(err) }, uid)
         }
         break
 
       case 'set_settings': {
-        const current = await loadSettings(uid)
-        const patch = msg.settings ?? {}
-        const next: ExtensionSettings = {
-          ...current,
-          distillConnectionId: typeof patch.distillConnectionId === 'string' && patch.distillConnectionId
-            ? patch.distillConnectionId
-            : patch.distillConnectionId === null ? null : current.distillConnectionId,
-          inStageInstructions: typeof patch.inStageInstructions === 'string'
-            ? normaliseInstructions(patch.inStageInstructions)
-            : patch.inStageInstructions === null ? null : current.inStageInstructions,
-        }
+        const next = applySettingsPatch(await loadSettings(uid), msg.settings ?? {})
         await saveSettings(next, uid)
         await pushStateFor(msg.chatId, uid)
         break

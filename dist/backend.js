@@ -2,10 +2,16 @@
 // src/shared/types.ts
 var DEFAULT_SETTINGS = {
   distillConnectionId: null,
-  inStageInstructions: null
+  inStageInstructions: null,
+  closingLine: null,
+  highTokenLimit: false
 };
-var INSTRUCTIONS_MAX_CHARS = 400;
-var DIRECTIVE_TOKEN_CAP = 120;
+var STANDARD_TOKEN_LIMITS = { directive: 120, cardTarget: 50, cardCap: 90, instructionsChars: 400, distillWords: 25 };
+var HIGH_TOKEN_LIMITS = { directive: 240, cardTarget: 100, cardCap: 180, instructionsChars: 800, distillWords: 50 };
+function tokenLimitsFor(settings) {
+  return settings.highTokenLimit ? HIGH_TOKEN_LIMITS : STANDARD_TOKEN_LIMITS;
+}
+var DIRECTIVE_TOKEN_CAP = STANDARD_TOKEN_LIMITS.directive;
 
 // src/core/hash.ts
 function normalizeGreeting(text) {
@@ -114,6 +120,10 @@ function arrivalFrame(style, scene, mood) {
   }
 }
 var TENSE_NOTE = "Keep the existing narrative tense and voice.";
+function effectiveClosing(custom) {
+  const t = custom ? clean(custom) : "";
+  return t.length > 0 ? t : TENSE_NOTE;
+}
 var DEFAULT_IN_STAGE_INSTRUCTIONS = `Keep the story inside this scene: let events and the conversation move forward within it, without leaving it or skipping ahead. ${TENSE_NOTE}`;
 function effectiveInstructions(custom) {
   const t = custom ? clean(custom) : "";
@@ -122,9 +132,9 @@ function effectiveInstructions(custom) {
 function partnerLine(char, partner) {
   return partner ? ` This scene is between ${char} and ${partner}.` : "";
 }
-function frame(tier, style, scene, mood, instructions, partner) {
+function frame(tier, style, scene, mood, instructions, closing, partner) {
   const where = `${scene}${partner}`;
-  return tier === "arrival" ? `${arrivalFrame(style, where, mood)} ${TENSE_NOTE}` : `${where} Mood: ${mood} ${instructions}`;
+  return tier === "arrival" ? `${arrivalFrame(style, where, mood)} ${closing}` : `${where} Mood: ${mood} ${instructions}`;
 }
 function renderDirective(tier, card, names, options = {}) {
   const style = effectiveTransition(options.transition);
@@ -134,9 +144,13 @@ function renderDirective(tier, card, names, options = {}) {
   const cardNames = options.group && partnerName && partnerName !== names.user ? { ...names, user: partnerName } : names;
   let scene = clean(substituteNames(card.scene, cardNames));
   let mood = clean(substituteNames(card.mood, cardNames));
-  const instructions = effectiveInstructions(options.instructions);
+  const fullScene = scene;
+  const fullMood = mood;
+  const textNames = options.textNames ?? names;
+  const instructions = clean(substituteNames(effectiveInstructions(options.instructions), textNames));
+  const closing = clean(substituteNames(effectiveClosing(options.closing), textNames));
   const partner = partnerLine(names.char, partnerName);
-  let body = frame(tier, style, scene, mood, instructions, partner);
+  let body = frame(tier, style, scene, mood, instructions, closing, partner);
   let truncated = false;
   if (body.length > capChars) {
     const frameLen = body.length - scene.length - mood.length;
@@ -146,152 +160,44 @@ function renderDirective(tier, card, names, options = {}) {
     if (scene.length + mood.length > budget)
       scene = truncateToChars(scene, Math.max(24, budget - mood.length));
     truncated = true;
-    body = frame(tier, style, scene, mood, instructions, partner);
+    body = frame(tier, style, scene, mood, instructions, closing, partner);
     if (body.length > capChars)
       body = truncateToChars(body, capChars);
   }
-  return { text: body, estimatedTokens: estimateTokens(body), truncated };
+  const tail = tier === "arrival" ? closing : instructions;
+  const fieldsIntact = scene === fullScene && mood === fullMood && body.includes(`${scene}${partner} Mood: ${mood}`);
+  return { text: body, estimatedTokens: estimateTokens(body), truncated, tailIntact: body.endsWith(tail), fieldsIntact };
 }
 function breakdownName(stageIndex, stageCount, tier) {
   return `Stagecoach \xB7 stage ${stageIndex + 1}/${stageCount} \xB7 ${tier}`;
 }
 
-// src/core/opening.ts
-function comparable(text) {
-  return normalizeGreeting(text).replace(/\s+/g, " ").toLowerCase();
+// src/core/settings.ts
+function normaliseInstructions(text, maxChars, builtIn = DEFAULT_IN_STAGE_INSTRUCTIONS) {
+  const t = text.replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return t.length === 0 || t === builtIn ? null : t;
 }
-function skeleton(text) {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+function storedText(v) {
+  return typeof v === "string" && v ? v : null;
 }
-var CHUNK = 60;
-var FUZZY_MIN = 40;
-var WHOLE_MIN = 12;
-var CHUNKS = 5;
-function chunkStarts(n) {
-  if (n <= CHUNK)
-    return [0];
-  const count = Math.min(CHUNKS, Math.floor(n / CHUNK) + 1);
-  const last = n - CHUNK;
-  const out = [];
-  for (let i = 0;i < count; i++)
-    out.push(Math.round(last * i / (count - 1)));
-  return Array.from(new Set(out));
+function normalizeSettings(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  return {
+    distillConnectionId: typeof r.distillConnectionId === "string" && r.distillConnectionId ? r.distillConnectionId : null,
+    inStageInstructions: storedText(r.inStageInstructions),
+    closingLine: storedText(r.closingLine),
+    highTokenLimit: r.highTokenLimit === true
+  };
 }
-var WHOLE = CHUNKS + 1;
-function fuzzyScore(greeting, haystack) {
-  const g = skeleton(greeting);
-  const h = skeleton(haystack);
-  if (g.length < WHOLE_MIN || h.length === 0)
-    return 0;
-  if (h.includes(g))
-    return WHOLE;
-  if (g.length < FUZZY_MIN)
-    return 0;
-  const starts = chunkStarts(g.length);
-  let hits = 0;
-  for (const s of starts)
-    if (h.includes(g.slice(s, s + CHUNK)))
-      hits++;
-  return hits >= Math.max(2, Math.ceil(starts.length / 2)) ? hits : 0;
-}
-function matchGreeting(greetings, readings) {
-  const targets = readings.map(comparable).filter((t) => t.length > 0);
-  if (targets.length === 0)
-    return null;
-  for (const g of greetings) {
-    for (const t of g.texts)
-      if (targets.includes(comparable(t)))
-        return g.key;
-  }
-  let best = null;
-  for (const g of greetings) {
-    let score = 0;
-    for (const t of g.texts)
-      for (const r of readings)
-        score = Math.max(score, fuzzyScore(t, r));
-    if (score === 0)
-      continue;
-    const length = Math.max(...g.texts.map((t) => skeleton(t).length));
-    const better = !best || score > best.score || score === WHOLE && best.score === WHOLE && length > best.length;
-    if (better)
-      best = { key: g.key, score, length };
-  }
-  return best ? best.key : null;
-}
-function sample(text, max = 90) {
-  const t = text.replace(/\s+/g, " ").trim();
-  return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t;
-}
-
-// src/core/group.ts
-function groupInfo(metadata, characterId) {
-  const meta = metadata && typeof metadata === "object" ? metadata : {};
-  const ids = Array.isArray(meta.character_ids) ? meta.character_ids.filter((v) => typeof v === "string" && v.length > 0) : [];
-  const isGroup = meta.group === true && ids.length > 0;
-  const memberIds = isGroup ? [characterId, ...ids.filter((id) => id !== characterId)] : [characterId];
-  const agi = meta.activeGreetingIndex;
-  const activeGreetingIndex = typeof agi === "number" && Number.isFinite(agi) && agi >= 0 ? Math.floor(agi) : null;
-  return { isGroup, memberIds, activeGreetingIndex };
-}
-
-// src/core/inject.ts
-function hasText2(content) {
-  if (typeof content === "string")
-    return content.trim().length > 0;
-  return Array.isArray(content) && content.some((p) => typeof p.text === "string" && p.text.trim().length > 0);
-}
-function historyIndices(messages) {
-  const out = [];
-  messages.forEach((m, i) => {
-    if (m.__isChatHistory === true)
-      out.push(i);
-  });
-  return out;
-}
-function injectSystemAtDepth(messages, directive, depth) {
-  const hist = historyIndices(messages);
-  const d = Math.max(0, Math.floor(depth));
-  let insertAt;
-  if (hist.length === 0) {
-    insertAt = messages.length;
-  } else if (d === 0) {
-    insertAt = hist[hist.length - 1] + 1;
-  } else {
-    const target = hist[Math.max(0, hist.length - d)];
-    insertAt = target;
-  }
-  const injected = { role: "system", content: directive };
-  const out = [...messages];
-  out.splice(insertAt, 0, injected);
-  return { messages: out, injectedIndex: insertAt, appliedMode: "system-at-depth" };
-}
-function wrapForAppend(directive) {
-  return `(OOC: ${directive} Do not reply to this note.)`;
-}
-function appendToLastUser(messages, directive, fallbackDepth = 0) {
-  const hist = historyIndices(messages).filter((i) => hasText2(messages[i].content));
-  const idx = hist.length > 0 ? hist[hist.length - 1] : -1;
-  if (idx === -1 || messages[idx].role !== "user")
-    return injectSystemAtDepth(messages, directive, fallbackDepth);
-  const src = messages[idx];
-  const sep = `
-
-`;
-  const note = wrapForAppend(directive);
-  let content;
-  if (typeof src.content === "string") {
-    content = src.content.length > 0 ? src.content + sep + note : note;
-  } else if (Array.isArray(src.content)) {
-    content = [...src.content, { type: "text", text: sep + note }];
-  } else {
-    content = note;
-  }
-  const out = [...messages];
-  out[idx] = { ...src, content };
-  return { messages: out, injectedIndex: null, appliedMode: "append-to-last-user" };
-}
-function injectDirective(messages, directive, mode, depth) {
-  return mode === "append-to-last-user" ? appendToLastUser(messages, directive, depth) : injectSystemAtDepth(messages, directive, depth);
+function applySettingsPatch(current, patch) {
+  const highTokenLimit = typeof patch.highTokenLimit === "boolean" ? patch.highTokenLimit : current.highTokenLimit;
+  const maxChars = tokenLimitsFor({ highTokenLimit }).instructionsChars;
+  return {
+    distillConnectionId: typeof patch.distillConnectionId === "string" && patch.distillConnectionId ? patch.distillConnectionId : patch.distillConnectionId === null ? null : current.distillConnectionId,
+    inStageInstructions: typeof patch.inStageInstructions === "string" ? normaliseInstructions(patch.inStageInstructions, maxChars) : patch.inStageInstructions === null ? null : current.inStageInstructions,
+    closingLine: typeof patch.closingLine === "string" ? normaliseInstructions(patch.closingLine, maxChars, TENSE_NOTE) : patch.closingLine === null ? null : current.closingLine,
+    highTokenLimit
+  };
 }
 
 // src/core/route.ts
@@ -466,19 +372,182 @@ function setDepth(route, depth) {
   return { ...route, timing: { ...route.timing ?? {}, depth: d } };
 }
 
+// src/core/preview.ts
+function noteOptions(route, hash, settings, group, drafts = {}) {
+  return {
+    transition: route ? transitionFor(route, hash) : DEFAULT_TRANSITION,
+    tokenCap: tokenLimitsFor(settings).directive,
+    instructions: drafts.instructions ?? settings.inStageInstructions,
+    closing: drafts.closing ?? settings.closingLine,
+    group
+  };
+}
+
+// src/core/opening.ts
+function comparable(text) {
+  return normalizeGreeting(text).replace(/\s+/g, " ").toLowerCase();
+}
+function skeleton(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+var CHUNK = 60;
+var FUZZY_MIN = 40;
+var WHOLE_MIN = 12;
+var CHUNKS = 5;
+function chunkStarts(n) {
+  if (n <= CHUNK)
+    return [0];
+  const count = Math.min(CHUNKS, Math.floor(n / CHUNK) + 1);
+  const last = n - CHUNK;
+  const out = [];
+  for (let i = 0;i < count; i++)
+    out.push(Math.round(last * i / (count - 1)));
+  return Array.from(new Set(out));
+}
+var WHOLE = CHUNKS + 1;
+function fuzzyScore(greeting, haystack) {
+  const g = skeleton(greeting);
+  const h = skeleton(haystack);
+  if (g.length < WHOLE_MIN || h.length === 0)
+    return 0;
+  if (h.includes(g))
+    return WHOLE;
+  if (g.length < FUZZY_MIN)
+    return 0;
+  const starts = chunkStarts(g.length);
+  let hits = 0;
+  for (const s of starts)
+    if (h.includes(g.slice(s, s + CHUNK)))
+      hits++;
+  return hits >= Math.max(2, Math.ceil(starts.length / 2)) ? hits : 0;
+}
+function matchGreeting(greetings, readings) {
+  const targets = readings.map(comparable).filter((t) => t.length > 0);
+  if (targets.length === 0)
+    return null;
+  for (const g of greetings) {
+    for (const t of g.texts)
+      if (targets.includes(comparable(t)))
+        return g.key;
+  }
+  let best = null;
+  for (const g of greetings) {
+    let score = 0;
+    for (const t of g.texts)
+      for (const r of readings)
+        score = Math.max(score, fuzzyScore(t, r));
+    if (score === 0)
+      continue;
+    const length = Math.max(...g.texts.map((t) => skeleton(t).length));
+    const better = !best || score > best.score || score === WHOLE && best.score === WHOLE && length > best.length;
+    if (better)
+      best = { key: g.key, score, length };
+  }
+  return best ? best.key : null;
+}
+function sample(text, max = 90) {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t;
+}
+
+// src/core/group.ts
+function groupInfo(metadata, characterId) {
+  const meta = metadata && typeof metadata === "object" ? metadata : {};
+  const ids = Array.isArray(meta.character_ids) ? meta.character_ids.filter((v) => typeof v === "string" && v.length > 0) : [];
+  const isGroup = meta.group === true && ids.length > 0;
+  const memberIds = isGroup ? [characterId, ...ids.filter((id) => id !== characterId)] : [characterId];
+  const agi = meta.activeGreetingIndex;
+  const activeGreetingIndex = typeof agi === "number" && Number.isFinite(agi) && agi >= 0 ? Math.floor(agi) : null;
+  return { isGroup, memberIds, activeGreetingIndex };
+}
+
+// src/core/inject.ts
+function hasText2(content) {
+  if (typeof content === "string")
+    return content.trim().length > 0;
+  return Array.isArray(content) && content.some((p) => typeof p.text === "string" && p.text.trim().length > 0);
+}
+function historyIndices(messages) {
+  const out = [];
+  messages.forEach((m, i) => {
+    if (m.__isChatHistory === true)
+      out.push(i);
+  });
+  return out;
+}
+function injectSystemAtDepth(messages, directive, depth) {
+  const hist = historyIndices(messages);
+  const d = Math.max(0, Math.floor(depth));
+  let insertAt;
+  if (hist.length === 0) {
+    insertAt = messages.length;
+  } else if (d === 0) {
+    insertAt = hist[hist.length - 1] + 1;
+  } else {
+    const target = hist[Math.max(0, hist.length - d)];
+    insertAt = target;
+  }
+  const injected = { role: "system", content: directive };
+  const out = [...messages];
+  out.splice(insertAt, 0, injected);
+  return { messages: out, injectedIndex: insertAt, appliedMode: "system-at-depth" };
+}
+function wrapForAppend(directive) {
+  return `(OOC: ${directive} Do not reply to this note.)`;
+}
+function appendToLastUser(messages, directive, fallbackDepth = 0) {
+  const hist = historyIndices(messages).filter((i) => hasText2(messages[i].content));
+  const idx = hist.length > 0 ? hist[hist.length - 1] : -1;
+  if (idx === -1 || messages[idx].role !== "user")
+    return injectSystemAtDepth(messages, directive, fallbackDepth);
+  const src = messages[idx];
+  const sep = `
+
+`;
+  const note = wrapForAppend(directive);
+  let content;
+  if (typeof src.content === "string") {
+    content = src.content.length > 0 ? src.content + sep + note : note;
+  } else if (Array.isArray(src.content)) {
+    content = [...src.content, { type: "text", text: sep + note }];
+  } else {
+    content = note;
+  }
+  const out = [...messages];
+  out[idx] = { ...src, content };
+  return { messages: out, injectedIndex: null, appliedMode: "append-to-last-user" };
+}
+function injectDirective(messages, directive, mode, depth) {
+  return mode === "append-to-last-user" ? appendToLastUser(messages, directive, depth) : injectSystemAtDepth(messages, directive, depth);
+}
+
 // src/backend.ts
 var LOG = "[Stagecoach]";
 var INTERCEPTOR_PRIORITY = 400;
-var routeCache = new Map;
-var cardCache = new Map;
-var namesCache = new Map;
-var characterCache = new Map;
-var chatCache = new Map;
+var userCaches = new Map;
+function cachesFor(userId) {
+  const key = userId ?? "";
+  let c = userCaches.get(key);
+  if (!c) {
+    c = { routes: new Map, cards: new Map, names: new Map, characters: new Map, chats: new Map, greetings: new Map, resolvedGreetings: new Map, openings: new Map, settings: null };
+    userCaches.set(key, c);
+  }
+  return c;
+}
+function eachUser(fn) {
+  for (const c of userCaches.values())
+    fn(c);
+}
+var knownUsers = new Set;
+function actingUser(id, record = true) {
+  if (id) {
+    if (record)
+      knownUsers.add(id);
+    return id;
+  }
+  return knownUsers.size === 1 ? knownUsers.values().next().value : undefined;
+}
 var fallbackIndexLogged = new Set;
-var resolvedGreetingCache = new Map;
-var lastOpening = new Map;
-var settingsCache = null;
-var currentUserId;
 function has(permission) {
   try {
     return spindle.permissions.has(permission);
@@ -496,8 +565,9 @@ function cardPath(hash) {
   return `cards/${hash}.json`;
 }
 async function loadRoute(chatId, userId) {
-  if (routeCache.has(chatId))
-    return routeCache.get(chatId) ?? null;
+  const cache = cachesFor(userId).routes;
+  if (cache.has(chatId))
+    return cache.get(chatId) ?? null;
   let route = null;
   try {
     const raw = await spindle.userStorage.getJson(routePath(chatId), { fallback: null, userId });
@@ -508,18 +578,21 @@ async function loadRoute(chatId, userId) {
   } catch (err) {
     spindle.log.warn(`${LOG} could not read route for chat ${chatId}: ${errMsg(err)}`);
   }
-  routeCache.set(chatId, route);
+  if (cache.has(chatId))
+    return cache.get(chatId) ?? null;
+  cache.set(chatId, route);
   return route;
 }
 async function saveRoute(route, userId) {
   await spindle.userStorage.setJson(routePath(route.chatId), route, { indent: 2, userId });
-  routeCache.set(route.chatId, route);
+  cachesFor(userId).routes.set(route.chatId, route);
 }
 async function loadCard(hash, userId) {
   if (!isValidHash(hash))
     return null;
-  if (cardCache.has(hash))
-    return cardCache.get(hash) ?? null;
+  const cache = cachesFor(userId).cards;
+  if (cache.has(hash))
+    return cache.get(hash) ?? null;
   let card = null;
   try {
     const raw = await spindle.userStorage.getJson(cardPath(hash), { fallback: null, userId });
@@ -527,12 +600,14 @@ async function loadCard(hash, userId) {
   } catch (err) {
     spindle.log.warn(`${LOG} could not read card ${hash.slice(0, 8)}: ${errMsg(err)}`);
   }
-  cardCache.set(hash, card);
+  if (cache.has(hash))
+    return cache.get(hash) ?? null;
+  cache.set(hash, card);
   return card;
 }
 async function saveCard(card, userId) {
   await spindle.userStorage.setJson(cardPath(card.hash), card, { indent: 2, userId });
-  cardCache.set(card.hash, card);
+  cachesFor(userId).cards.set(card.hash, card);
 }
 async function deleteCard(hash, userId) {
   if (!isValidHash(hash))
@@ -540,25 +615,23 @@ async function deleteCard(hash, userId) {
   try {
     await spindle.userStorage.delete(cardPath(hash), userId);
   } catch {}
-  cardCache.set(hash, null);
+  cachesFor(userId).cards.set(hash, null);
 }
 async function loadSettings(userId) {
-  if (settingsCache)
-    return settingsCache;
+  const cache = cachesFor(userId);
+  if (cache.settings)
+    return cache.settings;
+  let settings;
   try {
-    const raw = await spindle.userStorage.getJson("settings.json", { fallback: {}, userId });
-    settingsCache = { ...DEFAULT_SETTINGS, ...raw ?? {} };
+    settings = normalizeSettings(await spindle.userStorage.getJson("settings.json", { fallback: {}, userId }));
   } catch {
-    settingsCache = { ...DEFAULT_SETTINGS };
+    settings = { ...DEFAULT_SETTINGS };
   }
-  return settingsCache;
-}
-function normaliseInstructions(text) {
-  const t = text.replace(/\s+/g, " ").trim().slice(0, INSTRUCTIONS_MAX_CHARS);
-  return t.length === 0 || t === DEFAULT_IN_STAGE_INSTRUCTIONS ? null : t;
+  cache.settings ??= settings;
+  return cache.settings;
 }
 async function saveSettings(settings, userId) {
-  settingsCache = settings;
+  cachesFor(userId).settings = settings;
   await spindle.userStorage.setJson("settings.json", settings, { indent: 2, userId });
 }
 function str(v) {
@@ -583,8 +656,9 @@ function sanitizeCard(raw, hash) {
   };
 }
 async function getChat(chatId, userId) {
-  if (chatCache.has(chatId))
-    return chatCache.get(chatId) ?? null;
+  const cache = cachesFor(userId).chats;
+  if (cache.has(chatId))
+    return cache.get(chatId) ?? null;
   if (!has("chats"))
     return null;
   let chat = null;
@@ -593,12 +667,13 @@ async function getChat(chatId, userId) {
   } catch (err) {
     spindle.log.warn(`${LOG} chats.get failed: ${errMsg(err)}`);
   }
-  chatCache.set(chatId, chat);
+  cache.set(chatId, chat);
   return chat;
 }
 async function getCharacter(characterId, userId) {
-  if (characterCache.has(characterId))
-    return characterCache.get(characterId) ?? null;
+  const cache = cachesFor(userId).characters;
+  if (cache.has(characterId))
+    return cache.get(characterId) ?? null;
   if (!has("characters"))
     return null;
   let character = null;
@@ -607,12 +682,12 @@ async function getCharacter(characterId, userId) {
   } catch (err) {
     spindle.log.warn(`${LOG} characters.get failed: ${errMsg(err)}`);
   }
-  characterCache.set(characterId, character);
+  cache.set(characterId, character);
   return character;
 }
-var greetingsCache = new Map;
 async function chatGreetings(chat, userId) {
-  const cached = greetingsCache.get(chat.id);
+  const cache = cachesFor(userId).greetings;
+  const cached = cache.get(chat.id);
   if (cached)
     return cached;
   const info = groupInfo(chat.metadata, chat.character_id);
@@ -637,7 +712,7 @@ async function chatGreetings(chat, userId) {
     }
   }
   const pooled = { greetings, members };
-  greetingsCache.set(chat.id, pooled);
+  cache.set(chat.id, pooled);
   return pooled;
 }
 function greetingTexts(character) {
@@ -669,7 +744,8 @@ async function resolveOne(macro, chatId, characterId, userId) {
 }
 async function resolveNames(chatId, characterId, userId, preferRecord = false) {
   const cacheKey = `${chatId}:${characterId ?? ""}:${preferRecord ? "r" : "m"}`;
-  const cached = namesCache.get(cacheKey);
+  const cache = cachesFor(userId).names;
+  const cached = cache.get(cacheKey);
   if (cached)
     return cached;
   const [charName, userName] = await Promise.all([
@@ -680,7 +756,7 @@ async function resolveNames(chatId, characterId, userId, preferRecord = false) {
   if (!char && characterId)
     char = (await getCharacter(characterId, userId))?.name ?? null;
   const names = { char: char ?? "the character", user: userName ?? "the user" };
-  namesCache.set(cacheKey, names);
+  cache.set(cacheKey, names);
   return names;
 }
 var interceptorRegistered = false;
@@ -694,7 +770,7 @@ function tryRegisterInterceptor() {
       const chatId = context.chatId;
       if (!chatId)
         return messages;
-      const userId = context.userId || currentUserId;
+      const userId = actingUser(context.userId, false);
       const route = await loadRoute(chatId, userId);
       if (!route || !route.enabled || route.route.length === 0)
         return messages;
@@ -730,11 +806,8 @@ function tryRegisterInterceptor() {
       const isGroup = chat ? groupInfo(chat.metadata, chat.character_id).isGroup : false;
       const names = await resolveNames(chatId, owner ?? speaker, userId, isGroup || owner !== null && owner !== speaker);
       const settings = await loadSettings(userId);
-      const directive = renderDirective(tier, card, names, {
-        transition: transitionFor(route, stageHash),
-        instructions: settings.inStageInstructions,
-        group: isGroup
-      });
+      const textNames = isGroup && speaker && speaker !== (owner ?? speaker) ? await resolveNames(chatId, speaker, userId, true) : names;
+      const directive = renderDirective(tier, card, names, { ...noteOptions(route, stageHash, settings, isGroup), textNames });
       const result = injectDirective(messages, directive.text, route.injectMode, depthFor(route));
       spindle.log.info(`${LOG} injected as ${result.appliedMode} (speaker ${speaker ?? "?"}, card owner ${owner ?? "?"})`);
       if (result.injectedIndex === null)
@@ -757,26 +830,27 @@ spindle.permissions.onChanged(({ permission, granted }) => {
     tryRegisterInterceptor();
 });
 var onEvent = spindle.on;
-onEvent("CHARACTER_EDITED", () => {
-  characterCache.clear();
-  greetingsCache.clear();
-  namesCache.clear();
+var clearCharacters = () => eachUser((c) => {
+  c.characters.clear();
+  c.greetings.clear();
+  c.names.clear();
 });
-onEvent("CHARACTER_DELETED", () => {
-  characterCache.clear();
-  greetingsCache.clear();
-  namesCache.clear();
-});
-onEvent("PERSONA_CHANGED", () => {
-  namesCache.clear();
-  resolvedGreetingCache.clear();
-});
+onEvent("CHARACTER_EDITED", clearCharacters);
+onEvent("CHARACTER_DELETED", clearCharacters);
+onEvent("PERSONA_CHANGED", () => eachUser((c) => {
+  c.names.clear();
+  c.resolvedGreetings.clear();
+}));
 onEvent("CHAT_FORKED", (payload, eventUserId) => {
   (async () => {
     const p = payload;
     if (!p || typeof p.sourceChatId !== "string" || typeof p.forkedChatId !== "string")
       return;
-    const userId = eventUserId || currentUserId;
+    const userId = actingUser(eventUserId);
+    if (!userId && knownUsers.size > 1) {
+      spindle.log.warn(`${LOG} CHAT_FORKED arrived without a user id on a multi-user install; route not copied to ${p.forkedChatId}`);
+      return;
+    }
     try {
       const source = await loadRoute(p.sourceChatId, userId);
       if (!source)
@@ -794,10 +868,11 @@ onEvent("CHAT_FORKED", (payload, eventUserId) => {
 });
 onEvent("CHAT_CHANGED", (payload) => {
   const id = payload?.chat?.id;
-  if (typeof id === "string") {
-    chatCache.delete(id);
-    greetingsCache.delete(id);
-  }
+  if (typeof id === "string")
+    eachUser((c) => {
+      c.chats.delete(id);
+      c.greetings.delete(id);
+    });
 });
 async function listConnections(userId) {
   if (!has("generation"))
@@ -812,16 +887,17 @@ async function listConnections(userId) {
 }
 async function resolvedGreeting(chatId, characterId, hash, text, userId) {
   const key = `${chatId}:${hash}`;
-  const cached = resolvedGreetingCache.get(key);
+  const cache = cachesFor(userId).resolvedGreetings;
+  const cached = cache.get(key);
   if (cached !== undefined)
     return cached;
   let resolved = text;
   try {
     resolved = (await spindle.macros.resolve(text, { chatId, characterId, userId, commit: false })).text;
   } catch {}
-  if (resolvedGreetingCache.size > 500)
-    resolvedGreetingCache.clear();
-  resolvedGreetingCache.set(key, resolved);
+  if (cache.size > 500)
+    cache.clear();
+  cache.set(key, resolved);
   return resolved;
 }
 async function matchOpening(chatId, characterId, greetings, readings, userId) {
@@ -836,10 +912,11 @@ async function matchOpening(chatId, characterId, greetings, readings, userId) {
 }
 async function buildPanelState(chatId, userId, openingText, openingProbe, openingCandidates) {
   if (chatId) {
+    const openings = cachesFor(userId).openings;
     if (openingProbe !== undefined)
-      lastOpening.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] });
+      openings.set(chatId, { text: openingText ?? null, probe: openingProbe, candidates: openingCandidates ?? [] });
     else {
-      const prev = lastOpening.get(chatId);
+      const prev = openings.get(chatId);
       if (prev) {
         openingText = prev.text;
         openingProbe = prev.probe;
@@ -870,16 +947,16 @@ async function buildPanelState(chatId, userId, openingText, openingProbe, openin
     return state;
   }
   state.characterId = chat.character_id;
+  const info = groupInfo(chat.metadata, chat.character_id);
+  if (info.isGroup)
+    state.isGroup = true;
   const pooled = await chatGreetings(chat, userId);
   if (!pooled) {
     state.error = has("characters") ? "Could not load the character for this chat." : 'The "characters" permission is required to read greetings.';
   } else {
-    const info = groupInfo(chat.metadata, chat.character_id);
     state.characterName = pooled.members[0]?.name ?? null;
-    if (info.isGroup) {
-      state.isGroup = true;
+    if (info.isGroup)
       state.members = pooled.members;
-    }
     const greetings = [];
     for (const g of pooled.greetings)
       greetings.push({ ...g, card: await loadCard(g.hash, userId) });
@@ -935,19 +1012,21 @@ async function routeForWrite(chatId, userId) {
     return null;
   return newRoute(chatId, chat.character_id);
 }
-var DISTILL_SYSTEM = [
-  'You turn one greeting from a roleplay character card into a compact "stage card": a description of the story stage that greeting opens.',
-  "Reply with a single JSON object and nothing else, with exactly these string keys:",
-  '- "label": a 2-4 word name for this stage.',
-  '- "presupposes": what must already be true before this scene can open. Describe STATE, not events. At most 25 words.',
-  '- "scene": where and when, and what {{char}} is doing or has arranged. {{user}} may be present, but never describe anything {{user}} does, says, feels, or where {{user}} sits or stands. No dialogue. At most 25 words.',
-  '- "mood": tone, plus an explicit ceiling on intimacy or heat for this stage. At most 25 words.',
-  "Keep the placeholders {{char}} and {{user}} exactly as written; never replace them with names. Write in the present tense. Do not quote the greeting.",
-  "",
-  "Example output for a greeting where the character has invited the user to sit by the fire after weeks of riding together:",
-  '{"label":"Fireside evening","presupposes":"Some weeks have passed. {{user}} has ridden with {{char}} several times and the formality between them has worn off.","scene":"Evening at the ranch house, fire lit, a bottle {{char}} has been saving. {{char}} has cleared the evening for just the two of them.","mood":"Warm, charged, unhurried. Flirtation is mutual; nothing physical has happened yet."}'
-].join(`
+function distillSystem(words) {
+  return [
+    'You turn one greeting from a roleplay character card into a compact "stage card": a description of the story stage that greeting opens.',
+    "Reply with a single JSON object and nothing else, with exactly these string keys:",
+    '- "label": a 2-4 word name for this stage.',
+    `- "presupposes": what must already be true before this scene can open. Describe STATE, not events. At most ${words} words.`,
+    `- "scene": where and when, and what {{char}} is doing or has arranged. {{user}} may be present, but never describe anything {{user}} does, says, feels, or where {{user}} sits or stands. No dialogue. At most ${words} words.`,
+    `- "mood": tone, plus an explicit ceiling on intimacy or heat for this stage. At most ${words} words.`,
+    "Keep the placeholders {{char}} and {{user}} exactly as written; never replace them with names. Write in the present tense. Do not quote the greeting.",
+    "",
+    "Example output for a greeting where the character has invited the user to sit by the fire after weeks of riding together:",
+    '{"label":"Fireside evening","presupposes":"Some weeks have passed. {{user}} has ridden with {{char}} several times and the formality between them has worn off.","scene":"Evening at the ranch house, fire lit, a bottle {{char}} has been saving. {{char}} has cleared the evening for just the two of them.","mood":"Warm, charged, unhurried. Flirtation is mutual; nothing physical has happened yet."}'
+  ].join(`
 `);
+}
 function extractContent(result) {
   if (typeof result === "string")
     return result;
@@ -984,7 +1063,7 @@ function parseStageJson(text) {
     throw new Error('Reply had no usable "scene" or "mood" field.');
   return card;
 }
-async function distill(chatId, hash, connectionId, userId) {
+async function distill(chatId, hash, connectionId, runId, userId) {
   if (!has("generation"))
     throw new Error('The "generation" permission is required for Distill.');
   const chat = await getChat(chatId, userId);
@@ -1012,10 +1091,11 @@ async function distill(chatId, hash, connectionId, userId) {
   } catch (err) {
     throw new Error(`Could not resolve a connection for Distill: ${errMsg(err)}`);
   }
+  const { distillWords } = tokenLimitsFor(await loadSettings(userId));
   const request = {
     type: "raw",
     messages: [
-      { role: "system", content: DISTILL_SYSTEM },
+      { role: "system", content: distillSystem(distillWords) },
       { role: "user", content: `Greeting:
 
 ${greeting}` }
@@ -1031,14 +1111,17 @@ ${greeting}` }
   }
   const result = await spindle.generate.raw(request);
   const card = parseStageJson(extractContent(result));
-  send({ type: "distill_result", hash, card }, userId);
+  send({ type: "distill_result", hash, runId, card }, userId);
 }
 spindle.onFrontendMessage(async (payload, userId) => {
-  currentUserId = userId || currentUserId;
-  const uid = userId || currentUserId;
+  const uid = actingUser(userId);
   const msg = payload;
   if (!msg || typeof msg !== "object" || typeof msg.type !== "string")
     return;
+  if (!uid && knownUsers.size > 1) {
+    spindle.log.warn(`${LOG} ${msg.type} arrived without a user id on a multi-user install; ignored`);
+    return;
+  }
   try {
     switch (msg.type) {
       case "get_state":
@@ -1145,19 +1228,13 @@ spindle.onFrontendMessage(async (payload, userId) => {
         break;
       case "distill":
         try {
-          await distill(msg.chatId, msg.hash, msg.connectionId ?? null, uid);
+          await distill(msg.chatId, msg.hash, msg.connectionId ?? null, typeof msg.runId === "string" ? msg.runId : undefined, uid);
         } catch (err) {
-          send({ type: "distill_error", hash: msg.hash, message: errMsg(err) }, uid);
+          send({ type: "distill_error", hash: msg.hash, runId: typeof msg.runId === "string" ? msg.runId : undefined, message: errMsg(err) }, uid);
         }
         break;
       case "set_settings": {
-        const current = await loadSettings(uid);
-        const patch = msg.settings ?? {};
-        const next = {
-          ...current,
-          distillConnectionId: typeof patch.distillConnectionId === "string" && patch.distillConnectionId ? patch.distillConnectionId : patch.distillConnectionId === null ? null : current.distillConnectionId,
-          inStageInstructions: typeof patch.inStageInstructions === "string" ? normaliseInstructions(patch.inStageInstructions) : patch.inStageInstructions === null ? null : current.inStageInstructions
-        };
+        const next = applySettingsPatch(await loadSettings(uid), msg.settings ?? {});
         await saveSettings(next, uid);
         await pushStateFor(msg.chatId, uid);
         break;

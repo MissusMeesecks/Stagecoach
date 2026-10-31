@@ -84,17 +84,43 @@ export interface ConnectionInfo {
 export interface ExtensionSettings {
   /** Connection used for the Distill button. null = user's default. */
   distillConnectionId: string | null
-  /** Standing instructions after scene and mood in every in-stage note. null = the built-in default. */
+  /** Standing instructions after scene and mood in every in-stage note (sent only with in-stage reminders on, which have no UI). null = the built-in default. */
   inStageInstructions: string | null
+  /** Last sentence of every scene-change (arrival) note, the note that is actually sent. null = TENSE_NOTE. */
+  closingLine: string | null
+  /** "Higher token limit" switch: every budget in HIGH_TOKEN_LIMITS instead of STANDARD_TOKEN_LIMITS. */
+  highTokenLimit: boolean
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
   distillConnectionId: null,
   inStageInstructions: null,
+  closingLine: null,
+  highTokenLimit: false,
 }
 
-/** Hard cap on custom in-stage instructions; the whole note is capped at DIRECTIVE_TOKEN_CAP anyway. */
-export const INSTRUCTIONS_MAX_CHARS = 400
+/** The budgets the "Higher token limit" switch moves together. */
+export interface TokenLimits {
+  /** Soft token budget for the injected note; the renderer trims scene and mood, then the whole note, to fit. */
+  directive: number
+  /** Soft target for a whole stage card. */
+  cardTarget: number
+  /** Cap for a whole stage card; the editor's count turns red past it. */
+  cardCap: number
+  /** Longest custom closing line (or in-stage instructions) accepted. It shares the directive budget with scene and mood. */
+  instructionsChars: number
+  /** Per-field word limit Distill asks for. */
+  distillWords: number
+}
+
+/** Usable on a 4K-context connection. The default. */
+export const STANDARD_TOKEN_LIMITS: TokenLimits = { directive: 120, cardTarget: 50, cardCap: 90, instructionsChars: 400, distillWords: 25 }
+/** Every budget doubled, for connections with room to spare. */
+export const HIGH_TOKEN_LIMITS: TokenLimits = { directive: 240, cardTarget: 100, cardCap: 180, instructionsChars: 800, distillWords: 50 }
+
+export function tokenLimitsFor(settings: Pick<ExtensionSettings, 'highTokenLimit'>): TokenLimits {
+  return settings.highTokenLimit ? HIGH_TOKEN_LIMITS : STANDARD_TOKEN_LIMITS
+}
 
 /** Everything the drawer tab needs to render, for one chat. */
 export interface PanelState {
@@ -137,7 +163,8 @@ export type FrontendMessage =
   | { type: 'set_transition'; chatId: string; hash: string; style: TransitionStyle }
   | { type: 'save_card'; chatId: string | null; card: StageCard }
   | { type: 'delete_card'; chatId: string | null; hash: string }
-  | { type: 'distill'; chatId: string; hash: string; connectionId: string | null }
+  /** runId is echoed on the reply, so a reply from a run the panel gave up on (or replaced) can be told apart. */
+  | { type: 'distill'; chatId: string; hash: string; connectionId: string | null; runId?: string }
   | { type: 'set_settings'; chatId: string | null; settings: Partial<ExtensionSettings> }
   | { type: 'count_tokens'; requestId: string; text: string }
 
@@ -145,14 +172,10 @@ export type FrontendMessage =
 
 export type BackendMessage =
   | { type: 'state'; state: PanelState }
-  | { type: 'distill_result'; hash: string; card: Omit<StageCard, 'hash' | 'updatedAt'> }
-  | { type: 'distill_error'; hash: string; message: string }
+  | { type: 'distill_result'; hash: string; runId?: string; card: Omit<StageCard, 'hash' | 'updatedAt'> }
+  | { type: 'distill_error'; hash: string; runId?: string; message: string }
   | { type: 'token_count'; requestId: string; tokens: number; approximate: boolean }
   | { type: 'error'; message: string }
 
-/** Soft token budget for the injected block (usable on a 4K-context connection). */
-export const DIRECTIVE_TOKEN_CAP = 120
-/** Soft target for a whole stage card. */
-export const CARD_TOKEN_TARGET = 50
-/** Hard cap for a whole stage card. */
-export const CARD_TOKEN_CAP = 90
+/** Directive budget when no settings are in play (tests, callers that pass no cap). */
+export const DIRECTIVE_TOKEN_CAP = STANDARD_TOKEN_LIMITS.directive

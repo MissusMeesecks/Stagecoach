@@ -10,31 +10,34 @@ Stagecoach is an independent, unofficial community extension and is not affiliat
 
 Many cards write their alternate greetings as sequels ("two weeks later…") rather than alternatives. Picking one means a fresh chat with none of the history. Stagecoach lets you play them in any order, in one chat.
 
-![Stagecoach panel on a demo card: a three-stage route (Slow ranch dusk, Fences repaired, Hearthside evening), currently on stage 2 with a scene-change note queued for the next reply. Each later stage has its own "Way in" transition style.](docs/img/stage-editor-110.png)
+![Stagecoach panel on a demo card: a three-stage route (Ranch dusk, Fences repaired, Fireside evening), currently on stage 2 with a scene-change note queued for the next reply. Each later stage has its own "Way in" transition style.](docs/img/stage-editor-120.png)
 
 ## Features
  
 - A drawer tab with a per-chat enable toggle.
 - A route builder: pick which greetings count as stages, and in what order.
-- A stage-card editor (label, scene, mood) with a token count, a live preview of the injected text, and a **Distill** button that drafts the fields with one LLM call (model selectable).
-- The standing instructions after scene and mood ("Keep the story inside this scene…") are editable from the preview, with a reset to the original wording, so you can tune them for your model.
+- A stage-card editor (label, scene, mood) with a token count, a live preview of exactly the note that stage sends (its Way in, your closing line, and whether it is sent in this chat at all), and a **Distill** button that drafts the fields with one LLM call (model picked under Settings). A status light beside it shows red while Distill runs, green when it is done, amber if it failed.
+- The closing line of the scene-change note ("Keep the existing narrative tense and voice.") is editable under the preview, with a reset to the original wording, so you can tune it for your model.
+- A clear warning when a note is over the token cap and gets trimmed before sending, saying what was cut: under the preview in the card editor, and as a "⚠ Note trimmed" line on that stage in the route list. It counts `{{char}}` and `{{user}}` as written, so a note very close to the cap can still be trimmed by long names; the editor says when a note is that close.
+- Buttons and highlights follow your Lumiverse theme's accent colour, custom themes included.
 - A current-stage selector with **Advance** and **Back**.
 - Two injection modes: appended to the last user message wrapped as `(OOC: …)` (default; steered reliably in testing), or a system message at a chosen depth from the end of history (visible as its own Prompt Breakdown block, but some models ignore it).
+- A **Settings** area at the bottom of the panel. For every chat: the model Distill uses, and a **Higher token limit** switch (off by default) that doubles the budgets: notes up to ~240 tokens instead of ~120, cards aim for 100 tokens (cap 180) instead of 50 (cap 90), Distill writes up to 50 words per field instead of 25, and the closing line can run to 800 characters instead of 400. For the open chat: the injection mode and depth.
 - One note per stage: the first reply after you press Advance gets a scene-change note, and nothing else is injected. Stage 1 never gets a note, since the chat opened with that greeting.
 - A per-stage **Way in** choice that shapes the arrival wording: skip time and narrate the gap (default), hard cut, or develop the transition in-scene. Models differ in how they bridge scenes; pick per transition.
 
 ## Install
 
 1. Open Lumiverse → Extensions → install from GitHub URL and paste this repository's URL. The checked-in `dist/` build is what runs.
-2. Grant the `characters`, `chats`, `generation` and `interceptor` permissions.
+2. Grant the `characters`, `chats`, `generation` and `interceptor` permissions. Stagecoach asks for all four the first time it loads.
 3. Open a chat, then open the **Stages** drawer tab.
 
 ## Using it
 
 1. **Enable** the extension for the chat.
 2. **Add greetings to the route** in story order. Cards that write alternate greetings as "later chapters" work well; parallel alternate greetings may have a janky transition without extra prompt customization.
-3. **Edit each stage** and press **Distill** (or fill the fields in by hand), then **Save**. Aim for about 50 tokens per card, hard cap 90. Keep `{{char}}` and `{{user}}` literal; names are substituted at injection time.
-4. For each stage after the first, pick a **Way in** in the route list. It shapes the one note sent when you advance into that stage.
+3. **Edit each stage** and press **Distill** (or fill the fields in by hand), then **Save**. Aim for about 50 tokens per card, hard cap 90 (100 and 180 with **Higher token limit** on, under Settings). Keep `{{char}}` and `{{user}}` literal; names are substituted at injection time.
+4. For each stage after the first, pick a **Way in** in the route list (or in that stage's card editor, just above Save). It shapes the one note sent when you advance into that stage.
 5. Play. When a scene feels finished, press **Advance**. The next reply opens the new stage the way you chose. **Back** moves without sending anything. The note button beside them shows what the next reply will get and offers the opposite: **Skip this note** to move on silently, or **Send scene note** to set the current scene up again.
 
 Check the result in Prompt Breakdown (Extras -> Dry Run): in append mode the directive appears at the end of your latest user message; in system mode it is its own block. Either way it contains only the current stage's scene and mood.
@@ -56,8 +59,8 @@ bun run verify     # typecheck + tests + build
 
 Source lives in `src/`:
 
-- `core/` pure modules (hashing, tier selection, templates, injection, route transitions) with tests.
-- `backend.ts` the Bun worker: storage, the interceptor, Distill, frontend messaging.
+- `core/` pure modules (hashing, tier selection, templates, injection, route transitions, settings) with tests.
+- `backend.ts` the Bun worker: storage, the interceptor, Distill, frontend messaging. `backend.test.ts` runs it against a fake two-user host to check nothing crosses between users.
 - `frontend.ts` the drawer tab.
 - `shared/types.ts` data model and the frontend/backend message protocol.
 

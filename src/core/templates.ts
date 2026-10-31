@@ -65,8 +65,18 @@ function arrivalFrame(style: TransitionStyle, scene: string, mood: string): stri
   }
 }
 
-/** Appended to every arrival directive. Models otherwise drift to present tense or second person on a scene change. */
+/**
+ * The default last sentence of every arrival directive. Models otherwise drift
+ * to present tense or second person on a scene change. Users can replace it
+ * (settings.closingLine).
+ */
 export const TENSE_NOTE = 'Keep the existing narrative tense and voice.'
+
+/** Custom closing line for arrival notes, or TENSE_NOTE when unset or blank. */
+export function effectiveClosing(custom: string | null | undefined): string {
+  const t = custom ? clean(custom) : ''
+  return t.length > 0 ? t : TENSE_NOTE
+}
 
 /**
  * Standing instructions after scene and mood in every in-stage note. Users can
@@ -86,10 +96,10 @@ export function partnerLine(char: string, partner: string): string {
   return partner ? ` This scene is between ${char} and ${partner}.` : ''
 }
 
-function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string, instructions: string, partner: string): string {
+function frame(tier: Tier, style: TransitionStyle, scene: string, mood: string, instructions: string, closing: string, partner: string): string {
   const where = `${scene}${partner}`
   return tier === 'arrival'
-    ? `${arrivalFrame(style, where, mood)} ${TENSE_NOTE}`
+    ? `${arrivalFrame(style, where, mood)} ${closing}`
     : `${where} Mood: ${mood} ${instructions}`
 }
 
@@ -98,6 +108,13 @@ export interface RenderOptions {
   tokenCap?: number
   /** Replaces DEFAULT_IN_STAGE_INSTRUCTIONS in in-stage notes. Arrival notes ignore it. */
   instructions?: string | null
+  /** Replaces TENSE_NOTE as the last sentence of arrival notes. In-stage notes ignore it. */
+  closing?: string | null
+  /**
+   * Names for {{char}}/{{user}} in the closing line and instructions; defaults to `names`. These texts are global, so
+   * {{char}} should be whoever is replying: in a group that can be another member than the card's owner.
+   */
+  textNames?: Names
   /**
    * Group chat. The card's `with` field is honoured only here: the partner line
    * always appears ({{user}} when `with` is blank), and naming another
@@ -112,6 +129,10 @@ export interface RenderedDirective {
   text: string
   estimatedTokens: number
   truncated: boolean
+  /** The closing line (arrival) or the instructions (in-stage) survived trimming whole. */
+  tailIntact: boolean
+  /** The card's scene and mood (with the partner line) went out whole: neither was shortened nor cut off. */
+  fieldsIntact: boolean
 }
 
 export function renderDirective(tier: Tier, card: StageCard, names: Names, options: RenderOptions = {}): RenderedDirective {
@@ -123,10 +144,16 @@ export function renderDirective(tier: Tier, card: StageCard, names: Names, optio
   const cardNames: Names = options.group && partnerName && partnerName !== names.user ? { ...names, user: partnerName } : names
   let scene = clean(substituteNames(card.scene, cardNames))
   let mood = clean(substituteNames(card.mood, cardNames))
-  const instructions = effectiveInstructions(options.instructions)
+  const fullScene = scene
+  const fullMood = mood
+  // The user's own texts get names filled in like the card does. They are global, not per card, so {{user}} keeps meaning
+  // the user and {{char}} the one replying (textNames), even when the card's partner or owner is someone else.
+  const textNames = options.textNames ?? names
+  const instructions = clean(substituteNames(effectiveInstructions(options.instructions), textNames))
+  const closing = clean(substituteNames(effectiveClosing(options.closing), textNames))
   const partner = partnerLine(names.char, partnerName)
 
-  let body = frame(tier, style, scene, mood, instructions, partner)
+  let body = frame(tier, style, scene, mood, instructions, closing, partner)
   let truncated = false
   if (body.length > capChars) {
     // Trim the two card fields, mood first, until the frame fits.
@@ -135,11 +162,14 @@ export function renderDirective(tier: Tier, card: StageCard, names: Names, optio
     if (scene.length + mood.length > budget) mood = truncateToChars(mood, Math.max(24, Math.floor(budget * 0.35)))
     if (scene.length + mood.length > budget) scene = truncateToChars(scene, Math.max(24, budget - mood.length))
     truncated = true
-    body = frame(tier, style, scene, mood, instructions, partner)
+    body = frame(tier, style, scene, mood, instructions, closing, partner)
     if (body.length > capChars) body = truncateToChars(body, capChars)
   }
 
-  return { text: body, estimatedTokens: estimateTokens(body), truncated }
+  const tail = tier === 'arrival' ? closing : instructions
+  // Every frame carries the fields as "{scene}{partner} Mood: {mood}"; a hard cut at the end can still reach into them.
+  const fieldsIntact = scene === fullScene && mood === fullMood && body.includes(`${scene}${partner} Mood: ${mood}`)
+  return { text: body, estimatedTokens: estimateTokens(body), truncated, tailIntact: body.endsWith(tail), fieldsIntact }
 }
 
 export function breakdownName(stageIndex: number, stageCount: number, tier: Tier): string {

@@ -7,11 +7,15 @@ Kept so decisions survive the chat they were made in. Update it when the slate c
 - v0 from the brief: route builder, stage cards with Distill, stage pointer with Advance/Back, two injection modes.
 - Append-to-last-user is the default injection mode (system messages were ignored by the tested roleplay models).
 - Per-stage transition styles ("Way in"): hard cut, skip time and narrate the gap (default), develop in-scene.
-- `(OOC: ...)` wrapper in append mode; keep-tense-and-voice note on every directive.
+- `(OOC: ...)` wrapper in append mode; every scene-change note ends with a closing line (default: keep the existing tense and voice; editable).
 - Route copied onto forked chats; pointer rewinds when messages are deleted back past a stage change.
 - Detection of the greeting a chat opened with, with a one-click "make it stage 1".
 - Distill prompt keeps `{{user}}`'s actions out of the scene field.
 - One note per stage, at arrival; stage 1 silent. Periodic in-stage reminders looped the scene, so they are off (the backend still honours `timing.reminderEvery` if a future UI wants it).
+- Settings area at the bottom of the panel: the Distill model (moved out of the card editor) and a Higher token limit switch, both global, plus the per-chat Injection controls.
+- All four permissions asked for at first run; backend caches kept per user (operator installs); Distill status light; the card editor closes when the chat changes.
+- The card editor's preview shows the note that is actually sent (the scene-change note, in the stage's Way in); its closing line is editable. Highlights use the theme accent colour.
+- 1.2.0: a high-visibility trimming warning (editor and route list), Way in in the card editor, no scroll jump when the panel redraws, and route rows whose badges and buttons wrap together under the title on narrow panels.
 
 ## Parked
 

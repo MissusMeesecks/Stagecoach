@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test'
 import { hashGreeting, normalizeGreeting, isValidHash } from './hash.ts'
 import { chooseTier, highestHistoryIndex, countHistoryMessages, turnsInStage, reminderDue, repliesSince } from './tiers.ts'
-import { renderDirective, substituteNames, truncateToChars, breakdownName, effectiveInstructions, TENSE_NOTE, DEFAULT_IN_STAGE_INSTRUCTIONS } from './templates.ts'
+import { renderDirective, substituteNames, truncateToChars, breakdownName, effectiveInstructions, effectiveClosing, TENSE_NOTE, DEFAULT_IN_STAGE_INSTRUCTIONS } from './templates.ts'
 import { injectDirective, injectSystemAtDepth, appendToLastUser, wrapForAppend, type MessageLike } from './inject.ts'
 import { matchGreeting, fuzzyScore, skeleton } from './opening.ts'
 import { groupInfo } from './group.ts'
 import { applyRoute, newRoute, normalizeRoute, setStage, depthFor, setDepth, setTransition, transitionFor, rewindTo, forkRoute, anchorFor, replayStage, skipNote } from './route.ts'
+import { applySettingsPatch, normalizeSettings, normaliseInstructions } from './settings.ts'
+import { noteOptions, previewNote } from './preview.ts'
 import type { StageCard } from '../shared/types.ts'
+import { DEFAULT_SETTINGS, HIGH_TOKEN_LIMITS, STANDARD_TOKEN_LIMITS, tokenLimitsFor } from '../shared/types.ts'
 
 const card: StageCard = {
   hash: 'a'.repeat(64),
@@ -548,5 +551,224 @@ describe('group partner rules', () => {
     const solo = renderDirective('in-stage', { ...card2, with: 'Jake' }, names).text
     expect(solo).toContain('pours whiskey for Cherlene. Mood:')
     expect(solo).not.toContain('Jake')
+  })
+})
+
+describe('settings', () => {
+  test('settings files from older builds get the standard token limit', () => {
+    expect(normalizeSettings({ distillConnectionId: 'c1', inStageInstructions: 'Stay put.' })).toEqual({ distillConnectionId: 'c1', inStageInstructions: 'Stay put.', closingLine: null, highTokenLimit: false })
+    expect(normalizeSettings(null)).toEqual(DEFAULT_SETTINGS)
+    expect(normalizeSettings({ distillConnectionId: '', inStageInstructions: 7, highTokenLimit: 'yes' })).toEqual(DEFAULT_SETTINGS)
+    expect(normalizeSettings({ highTokenLimit: true }).highTokenLimit).toBe(true)
+  })
+  test('stored instructions written under the higher limit survive it being switched off', () => {
+    const long = 'rule '.repeat(150).trim()
+    expect(normalizeSettings({ inStageInstructions: long, highTokenLimit: false }).inStageInstructions).toBe(long)
+  })
+  test('a patch changes only the fields it carries', () => {
+    const current = { distillConnectionId: 'c1', inStageInstructions: 'Stay put.', closingLine: 'Stay grounded.', highTokenLimit: false }
+    expect(applySettingsPatch(current, { highTokenLimit: true })).toEqual({ ...current, highTokenLimit: true })
+    expect(applySettingsPatch(current, { distillConnectionId: null })).toEqual({ ...current, distillConnectionId: null })
+    expect(applySettingsPatch(current, { inStageInstructions: null })).toEqual({ ...current, inStageInstructions: null })
+    expect(applySettingsPatch(current, {})).toEqual(current)
+  })
+  test('custom instructions are capped by the token-limit setting in force', () => {
+    const long = 'x'.repeat(1000)
+    const off = { ...DEFAULT_SETTINGS }
+    const on = { ...DEFAULT_SETTINGS, highTokenLimit: true }
+    expect(applySettingsPatch(off, { inStageInstructions: long }).inStageInstructions).toHaveLength(STANDARD_TOKEN_LIMITS.instructionsChars)
+    expect(applySettingsPatch(on, { inStageInstructions: long }).inStageInstructions).toHaveLength(HIGH_TOKEN_LIMITS.instructionsChars)
+    // Switching on and saving in the same patch uses the new limit.
+    expect(applySettingsPatch(off, { highTokenLimit: true, inStageInstructions: long }).inStageInstructions).toHaveLength(HIGH_TOKEN_LIMITS.instructionsChars)
+    expect(normaliseInstructions(`  ${DEFAULT_IN_STAGE_INSTRUCTIONS} `, 400)).toBeNull()
+    expect(normaliseInstructions('   ', 400)).toBeNull()
+  })
+  test('the switch doubles every budget and defaults to off', () => {
+    expect(tokenLimitsFor(DEFAULT_SETTINGS)).toBe(STANDARD_TOKEN_LIMITS)
+    expect(tokenLimitsFor({ highTokenLimit: true })).toBe(HIGH_TOKEN_LIMITS)
+    expect(STANDARD_TOKEN_LIMITS).toEqual({ directive: 120, cardTarget: 50, cardCap: 90, instructionsChars: 400, distillWords: 25 })
+    for (const key of Object.keys(STANDARD_TOKEN_LIMITS) as Array<keyof typeof STANDARD_TOKEN_LIMITS>) {
+      expect(HIGH_TOKEN_LIMITS[key]).toBe(STANDARD_TOKEN_LIMITS[key] * 2)
+    }
+  })
+  test('the higher directive cap lets a longer card through untrimmed, and still caps it', () => {
+    const longer = { ...card, scene: `${card.scene} ${'The rain has not let up for days and the creek is running high. '.repeat(3)}`.trim() }
+    const standard = renderDirective('in-stage', longer, names)
+    const high = renderDirective('in-stage', longer, names, { tokenCap: HIGH_TOKEN_LIMITS.directive })
+    expect(standard.truncated).toBe(true)
+    expect(high.truncated).toBe(false)
+    expect(high.text).toContain('creek is running high')
+    expect(high.text.endsWith(DEFAULT_IN_STAGE_INSTRUCTIONS)).toBe(true)
+    const fat = { ...card, scene: 'word '.repeat(600), mood: 'tone '.repeat(400) }
+    for (const tier of ['arrival', 'in-stage'] as const) {
+      const r = renderDirective(tier, fat, names, { tokenCap: HIGH_TOKEN_LIMITS.directive })
+      expect(r.truncated).toBe(true)
+      expect(r.estimatedTokens).toBeLessThanOrEqual(HIGH_TOKEN_LIMITS.directive)
+      expect(r.estimatedTokens).toBeGreaterThan(STANDARD_TOKEN_LIMITS.directive)
+    }
+  })
+})
+
+describe('closing line', () => {
+  test('replaces the tense note at the end of every arrival note, whatever the way in', () => {
+    for (const transition of ['elapse', 'cut', 'flow'] as const) {
+      const base = renderDirective('arrival', card, names, { transition }).text
+      expect(base.endsWith(TENSE_NOTE)).toBe(true)
+      const custom = renderDirective('arrival', card, names, { transition, closing: '  Write in past tense,  third person. ' }).text
+      expect(custom.endsWith('Write in past tense, third person.')).toBe(true)
+      expect(custom).not.toContain(TENSE_NOTE)
+      expect(custom.replace('Write in past tense, third person.', TENSE_NOTE)).toBe(base)
+    }
+  })
+  test('blank or unset falls back to the tense note; in-stage notes ignore it', () => {
+    const base = renderDirective('arrival', card, names).text
+    expect(renderDirective('arrival', card, names, { closing: '   ' }).text).toBe(base)
+    expect(renderDirective('arrival', card, names, { closing: null }).text).toBe(base)
+    expect(effectiveClosing(undefined)).toBe(TENSE_NOTE)
+    expect(renderDirective('in-stage', card, names, { closing: 'Something else.' }).text).toBe(renderDirective('in-stage', card, names).text)
+  })
+  test('a long closing line still leaves room for the card and stays under the cap', () => {
+    const r = renderDirective('arrival', card, names, { closing: 'rule '.repeat(80) })
+    expect(r.estimatedTokens).toBeLessThanOrEqual(120)
+    expect(r.truncated).toBe(true)
+  })
+  test('settings store it like the instructions: trimmed, capped, default or blank as null', () => {
+    const off = { ...DEFAULT_SETTINGS }
+    expect(normalizeSettings({}).closingLine).toBeNull()
+    expect(normalizeSettings({ closingLine: 'Stay grounded.' }).closingLine).toBe('Stay grounded.')
+    expect(applySettingsPatch(off, { closingLine: '  Stay   grounded. ' }).closingLine).toBe('Stay grounded.')
+    expect(applySettingsPatch(off, { closingLine: TENSE_NOTE }).closingLine).toBeNull()
+    expect(applySettingsPatch(off, { closingLine: '   ' }).closingLine).toBeNull()
+    expect(applySettingsPatch(off, { closingLine: 'x'.repeat(1000) }).closingLine).toHaveLength(STANDARD_TOKEN_LIMITS.instructionsChars)
+    expect(applySettingsPatch({ ...off, closingLine: 'Kept.' }, { highTokenLimit: true }).closingLine).toBe('Kept.')
+    expect(applySettingsPatch({ ...off, closingLine: 'Kept.' }, { closingLine: null }).closingLine).toBeNull()
+  })
+})
+
+describe('note preview', () => {
+  const h = (c: string) => c.repeat(64)
+  const settings = { ...DEFAULT_SETTINGS }
+  const at = (hash: string) => ({ ...card, hash })
+  const route = (extra: Record<string, unknown> = {}) => ({ ...newRoute('c', 'ch'), route: [h('a'), h('b'), h('c')], stageIndex: 1, enteredAt: [0, 4], ...extra })
+  const literal = { char: '{{char}}', user: '{{user}}' }
+
+  test('a later stage previews the scene-change note in its own Way in, with the closing line', () => {
+    const r = route({ transitions: { [h('c')]: 'cut' } })
+    const p = previewNote({ card: at(h('c')), route: r, settings: { ...settings, closingLine: 'Stay in past tense.' }, group: false, names: literal })
+    expect(p.placement).toBe('sent')
+    expect(p.stageNumber).toBe(3)
+    expect(p.stageCount).toBe(3)
+    expect(p.transition).toBe('cut')
+    expect(p.arrival!.text).toContain('Cut straight to this scene')
+    expect(p.arrival!.text.endsWith('Stay in past tense.')).toBe(true)
+    expect(p.reminder).toBeNull()
+  })
+  test('the preview is exactly what the interceptor renders for the same card', () => {
+    const r = route({ transitions: { [h('b')]: 'flow' } })
+    const s = { ...settings, closingLine: 'Keep it short.', highTokenLimit: true }
+    const p = previewNote({ card: at(h('b')), route: r, settings: s, group: false, names })
+    expect(p.arrival!.text).toBe(renderDirective('arrival', at(h('b')), names, noteOptions(r, h('b'), s, false)).text)
+  })
+  test('stage 1 and cards off the route are marked as not sent, with what they would read', () => {
+    const r = route()
+    const one = previewNote({ card: at(h('a')), route: r, settings, group: false, names: literal })
+    expect(one.placement).toBe('stage-one')
+    expect(one.arrival!.text.startsWith('Time passes.')).toBe(true)
+    const off = previewNote({ card: at(h('d')), route: r, settings, group: false, names: literal })
+    expect(off.placement).toBe('off-route')
+    expect(off.stageNumber).toBeNull()
+    expect(off.transition).toBe('elapse')
+    expect(previewNote({ card: at(h('a')), route: null, settings, group: false, names: literal }).placement).toBe('off-route')
+  })
+  test('a card with neither scene nor mood sends nothing', () => {
+    const p = previewNote({ card: { ...at(h('b')), scene: '  ', mood: '' }, route: route(), settings, group: false, names: literal })
+    expect(p.placement).toBe('empty')
+    expect(p.arrival).toBeNull()
+  })
+  test('the legacy in-stage reminder shows only where reminders are on, with its own wording', () => {
+    const r = route({ timing: { reminderEvery: 3 } })
+    const s = { ...settings, closingLine: 'Closing.', inStageInstructions: 'Reminder wording.' }
+    const p = previewNote({ card: at(h('b')), route: r, settings: s, group: false, names: literal })
+    expect(p.reminder!.every).toBe(3)
+    expect(p.reminder!.note.text.endsWith('Reminder wording.')).toBe(true)
+    expect(p.reminder!.note.text).not.toContain('Closing.')
+    expect(p.arrival!.text).not.toContain('Reminder wording.')
+    expect(previewNote({ card: at(h('b')), route: route(), settings: s, group: false, names: literal }).reminder).toBeNull()
+  })
+  test('unsaved editor text is previewed in place of the saved settings', () => {
+    const s = { ...settings, closingLine: 'Saved closing.' }
+    const p = previewNote({ card: at(h('b')), route: route(), settings: s, group: false, names: literal, drafts: { closing: 'Draft closing.' } })
+    expect(p.arrival!.text.endsWith('Draft closing.')).toBe(true)
+    // A cleared draft means the built-in default, not the saved text.
+    expect(previewNote({ card: at(h('b')), route: route(), settings: s, group: false, names: literal, drafts: { closing: '' } }).arrival!.text.endsWith(TENSE_NOTE)).toBe(true)
+  })
+})
+
+describe('names in the user\'s own texts', () => {
+  test('{{char}} and {{user}} in the closing line and the reminder wording are filled in', () => {
+    const a = renderDirective('arrival', card, names, { closing: "Stay in {{char}}'s voice; never speak for {{user}}." }).text
+    expect(a.endsWith("Stay in Wade's voice; never speak for Cherlene.")).toBe(true)
+    const r = renderDirective('in-stage', card, names, { instructions: 'Keep {{char}} near {{ user }}.' }).text
+    expect(r.endsWith('Keep Wade near Cherlene.')).toBe(true)
+  })
+  test('in a group scene with another partner, {{user}} in the closing line still means the user', () => {
+    const a = renderDirective('arrival', { ...card, with: 'Jake' }, names, { group: true, closing: 'Never speak for {{user}}.' }).text
+    expect(a).toContain('This scene is between Wade and Jake.')
+    expect(a.endsWith('Never speak for Cherlene.')).toBe(true)
+  })
+})
+
+describe('note preview edges', () => {
+  const h = (ch: string) => ch.repeat(64)
+  const r = { ...newRoute('c', 'ch'), route: [h('a'), h('b')], stageIndex: 1, enteredAt: [0, 4] }
+  const literal = { char: '{{char}}', user: '{{user}}' }
+  test('a card with only a scene, or only a mood, is still sent', () => {
+    for (const fields of [{ scene: 'Dusk at the rail.', mood: '' }, { scene: '', mood: 'Easy.' }]) {
+      const p = previewNote({ card: { ...card, hash: h('b'), ...fields }, route: r, settings: DEFAULT_SETTINGS, group: false, names: literal })
+      expect(p.placement).toBe('sent')
+      expect(p.arrival).not.toBeNull()
+    }
+  })
+  test('a group preview carries the partner line, and the with field steers {{user}}', () => {
+    const p = previewNote({ card: { ...card, hash: h('b'), scene: '{{user}} waits at the rail.', with: 'Jake' }, route: r, settings: DEFAULT_SETTINGS, group: true, names })
+    expect(p.arrival!.text).toContain('Jake waits at the rail. This scene is between Wade and Jake.')
+    expect(previewNote({ card: { ...card, hash: h('b'), with: 'Jake' }, route: r, settings: DEFAULT_SETTINGS, group: false, names }).arrival!.text).not.toContain('between')
+  })
+})
+
+describe('closing line edges', () => {
+  test('textNames fill the user\'s own texts; the card keeps its own names', () => {
+    const speaker = { char: 'Mara', user: 'Cherlene' }
+    const a = renderDirective('arrival', card, names, { closing: 'Write only as {{char}}.', textNames: speaker }).text
+    expect(a).toContain('a bottle Wade has been saving')
+    expect(a.endsWith('Write only as Mara.')).toBe(true)
+  })
+  test('tailIntact says whether the closing line survived trimming', () => {
+    expect(renderDirective('arrival', card, names, { closing: 'Never speak for {{User}}.' }).tailIntact).toBe(true)
+    const fat = { ...card, scene: 'word '.repeat(300), mood: 'tone '.repeat(200) }
+    const kept = renderDirective('arrival', fat, names, { closing: 'Short closing.' })
+    expect(kept.truncated).toBe(true)
+    expect(kept.tailIntact).toBe(true)
+    const cut = renderDirective('arrival', card, names, { closing: 'rule '.repeat(110) })
+    expect(cut.tailIntact).toBe(false)
+  })
+})
+
+describe('what trimming cut', () => {
+  test('a long card: the fields are cut, the closing line is whole', () => {
+    const r = renderDirective('arrival', { ...card, scene: 'word '.repeat(300), mood: 'tone '.repeat(200) }, names)
+    expect(r.truncated).toBe(true)
+    expect(r.fieldsIntact).toBe(false)
+    expect(r.tailIntact).toBe(true)
+  })
+  test('a short card with a very long closing line: only the closing line is cut', () => {
+    const r = renderDirective('arrival', { ...card, scene: 'A barn.', mood: 'Calm.' }, names, { closing: 'Keep every detail consistent with what came before. '.repeat(8) })
+    expect(r.truncated).toBe(true)
+    expect(r.fieldsIntact).toBe(true)
+    expect(r.tailIntact).toBe(false)
+  })
+  test('nothing trimmed: both intact', () => {
+    const r = renderDirective('arrival', card, names)
+    expect([r.truncated, r.fieldsIntact, r.tailIntact]).toEqual([false, true, true])
   })
 })
